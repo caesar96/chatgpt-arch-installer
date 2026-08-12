@@ -7,6 +7,8 @@ CONFIG_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/chatgpt/install.conf
 DESKTOP_FILE=${XDG_DATA_HOME:-$HOME/.local/share}/applications/chatgpt-local.desktop
 COMMAND_PATH=$HOME/.local/bin/chatgpt
 DEFAULT_ROOT=$HOME/Apps/chatgpt-linux
+NATIVE_DECORATION_PATCH=patch-native-decoration.py
+NATIVE_DECORATION_OVERRIDE=
 
 die() {
   printf 'chatgpt: %s\n' "$*" >&2
@@ -17,17 +19,21 @@ usage() {
   printf '%s\n' \
     'Usage: install-codex-app.sh [DIRECTORY]' \
     '       install-codex-app.sh --directory DIRECTORY' \
+    '       install-codex-app.sh --native-window-decoration [DIRECTORY]' \
+    '       install-codex-app.sh --no-native-window-decoration [DIRECTORY]' \
     '       install-codex-app.sh --check' \
     '' \
     'Install the ChatGPT/Codex desktop app locally from the latest amd64 DEB.' \
-    'No root privileges or system package installation are required.'
+    'No root privileges or system package installation are required.' \
+    'The installer can optionally enable native system window decorations.'
 }
 
 chatgpt_usage() {
   printf '%s\n' \
-    'Usage: chatgpt [update]' \
+    'Usage: chatgpt [update [DECORATION_OPTION]]' \
     '  chatgpt         Open ChatGPT in the current terminal directory' \
-    '  chatgpt update  Download and install the latest app version'
+    '  chatgpt update  Download and install the latest app version' \
+    '  DECORATION_OPTION: --native-window-decoration or --no-native-window-decoration'
 }
 
 resolve_self_path() {
@@ -45,6 +51,8 @@ resolve_self_path() {
     *) SELF_PATH=$(CDPATH= cd -- "$(dirname -- "$SELF_PATH")" && pwd -P)/$(basename -- "$SELF_PATH") ;;
   esac
   [ -f "$SELF_PATH" ] || die "installer script cannot be found at $SELF_PATH"
+  INSTALLER_DIRECTORY=$(CDPATH= cd -- "$(dirname -- "$SELF_PATH")" && pwd -P) \
+    || die 'cannot determine the installer directory'
 }
 
 check_architecture() {
@@ -66,6 +74,57 @@ require_host_tools() {
     printf '%s\n' 'Install the corresponding CachyOS/Arch packages, then rerun this script.' >&2
     return 1
   fi
+}
+
+set_native_decoration_override() {
+  requested_value=$1
+  if [ -n "$NATIVE_DECORATION_OVERRIDE" ] && [ "$NATIVE_DECORATION_OVERRIDE" != "$requested_value" ]; then
+    die 'conflicting native decoration options'
+  fi
+  NATIVE_DECORATION_OVERRIDE=$requested_value
+}
+
+parse_native_decoration_option() {
+  case "$1" in
+    --native-window-decoration)
+      set_native_decoration_override 1
+      return 0
+      ;;
+    --no-native-window-decoration)
+      set_native_decoration_override 0
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+ask_native_decoration_preference() {
+  if [ -n "$NATIVE_DECORATION_OVERRIDE" ]; then
+    NATIVE_DECORATIONS=$NATIVE_DECORATION_OVERRIDE
+    return 0
+  fi
+  NATIVE_DECORATIONS=0
+  printf '%s' 'Use native system window decorations for ChatGPT? [y/N]: '
+  IFS= read -r native_decoration_answer \
+    || die 'could not read native decoration preference'
+  case "$native_decoration_answer" in
+    y|Y|yes|Yes|YES) NATIVE_DECORATIONS=1 ;;
+  esac
+}
+
+require_native_decoration_tools() {
+  [ "$NATIVE_DECORATIONS" -eq 0 ] && return 0
+  command -v python3 >/dev/null 2>&1 \
+    || die 'native window decorations require python3'
+  if [ -r "$INSTALLER_DIRECTORY/$NATIVE_DECORATION_PATCH" ]; then
+    return 0
+  fi
+  if [ -n "${APP_ROOT-}" ] && [ -r "$APP_ROOT/$NATIVE_DECORATION_PATCH" ]; then
+    return 0
+  fi
+  die "native decoration patch script is missing: $NATIVE_DECORATION_PATCH"
 }
 
 check_host_libraries() {
@@ -243,11 +302,39 @@ write_run_launcher() {
   chmod u+x "$launcher_path"
 }
 
+write_native_decoration_patch() {
+  patch_source=
+  if [ -r "$INSTALLER_DIRECTORY/$NATIVE_DECORATION_PATCH" ]; then
+    patch_source=$INSTALLER_DIRECTORY/$NATIVE_DECORATION_PATCH
+  elif [ -r "$APP_ROOT/$NATIVE_DECORATION_PATCH" ]; then
+    patch_source=$APP_ROOT/$NATIVE_DECORATION_PATCH
+  fi
+  if [ -z "$patch_source" ]; then
+    [ "$NATIVE_DECORATIONS" -eq 0 ] && return 0
+    printf 'chatgpt: native decoration patch script is missing: %s\n' "$NATIVE_DECORATION_PATCH" >&2
+    return 1
+  fi
+
+  patch_temporary="$APP_ROOT/$NATIVE_DECORATION_PATCH.$$"
+  if ! cp "$patch_source" "$patch_temporary"; then
+    printf '%s\n' 'chatgpt: could not install the native decoration patch script' >&2
+    return 1
+  fi
+  chmod u+x "$patch_temporary"
+  mv -f "$patch_temporary" "$APP_ROOT/$NATIVE_DECORATION_PATCH"
+}
+
+apply_native_decoration_patch() {
+  [ "$NATIVE_DECORATIONS" -eq 1 ] || return 0
+  python3 "$APP_ROOT/$NATIVE_DECORATION_PATCH" --apply || return 1
+  printf '%s\n' 'Native system window decorations enabled.'
+}
+
 write_config() {
   config_directory=$(dirname -- "$CONFIG_FILE")
   mkdir -p "$config_directory"
   config_temporary="$CONFIG_FILE.$$"
-  printf '%s\n' "$APP_ROOT" > "$config_temporary"
+  printf '%s\n' "$APP_ROOT" "native_decorations=$NATIVE_DECORATIONS" > "$config_temporary"
   chmod 600 "$config_temporary"
   mv -f "$config_temporary" "$CONFIG_FILE"
 }
@@ -259,6 +346,16 @@ write_command_copy() {
   cp "$SELF_PATH" "$command_temporary"
   chmod u+x "$command_temporary"
   mv -f "$command_temporary" "$COMMAND_PATH"
+  patch_source="$INSTALLER_DIRECTORY/$NATIVE_DECORATION_PATCH"
+  if [ -r "$patch_source" ]; then
+    patch_destination="$command_directory/$NATIVE_DECORATION_PATCH"
+    if [ "$patch_source" != "$patch_destination" ]; then
+      patch_command_temporary="$patch_destination.$$"
+      cp "$patch_source" "$patch_command_temporary"
+      chmod u+x "$patch_command_temporary"
+      mv -f "$patch_command_temporary" "$patch_destination"
+    fi
+  fi
 }
 
 write_desktop_entry() {
@@ -366,6 +463,23 @@ install_payload() {
   launcher_temporary="$temporary_root/run-chatgpt"
   write_run_launcher "$launcher_temporary"
   mv -f "$launcher_temporary" "$APP_ROOT/run-chatgpt"
+  rollback_payload() {
+    failed_usr="$temporary_root/failed-usr"
+    if [ -e "$APP_ROOT/usr" ]; then
+      mv "$APP_ROOT/usr" "$failed_usr" || true
+    fi
+    if [ -e "$backup_usr" ]; then
+      mv "$backup_usr" "$APP_ROOT/usr" || true
+    fi
+  }
+  if [ "$NATIVE_DECORATIONS" -eq 1 ]; then
+    if ! write_native_decoration_patch || ! apply_native_decoration_patch; then
+      rollback_payload
+      die 'could not apply the native window decoration patch; the previous payload was restored'
+    fi
+  else
+    rm -f "$APP_ROOT/$NATIVE_DECORATION_PATCH"
+  fi
   printf 'Application payload installed in %s.\n' "$APP_ROOT"
 }
 
@@ -378,6 +492,12 @@ load_configured_root() {
     *) die "installation directory must be absolute: $APP_ROOT" ;;
   esac
   [ -x "$APP_ROOT/run-chatgpt" ] || die "launcher not found in $APP_ROOT"
+  NATIVE_DECORATIONS=$(awk -F= '$1 == "native_decorations" {print $2; exit}' "$CONFIG_FILE")
+  NATIVE_DECORATIONS=${NATIVE_DECORATIONS:-0}
+  case "$NATIVE_DECORATIONS" in
+    0|1) ;;
+    *) die "invalid native decoration setting in $CONFIG_FILE" ;;
+  esac
 }
 
 finish_install() {
@@ -402,7 +522,9 @@ install_app() {
   require_host_tools || exit 1
   check_host_libraries || exit 1
   check_desktop_helpers || exit 1
+  ask_native_decoration_preference
   resolve_install_root "$1"
+  require_native_decoration_tools
   prepare_install_root
   install_payload
   finish_install
@@ -414,26 +536,49 @@ update_app() {
   check_host_libraries || exit 1
   check_desktop_helpers || exit 1
   load_configured_root
+  if [ -n "$NATIVE_DECORATION_OVERRIDE" ]; then
+    NATIVE_DECORATIONS=$NATIVE_DECORATION_OVERRIDE
+  fi
+  require_native_decoration_tools
   is_running_at "$APP_ROOT" && die 'close ChatGPT before updating it'
   install_payload
   finish_install
 }
 
 run_chatgpt() {
+  if [ "$#" -gt 0 ]; then
+    case "$1" in
+      --native-window-decoration|--no-native-window-decoration)
+        parse_native_decoration_option "$1"
+        shift
+        ;;
+    esac
+  fi
   load_configured_root
   case "${1-}" in
     '')
+      [ -z "$NATIVE_DECORATION_OVERRIDE" ] \
+        || die 'decoration options can only be used with `chatgpt update`'
       exec "$APP_ROOT/run-chatgpt" --open-project "$PWD"
       ;;
     update)
       shift
-      [ "$#" -eq 0 ] || die 'usage: chatgpt update'
+      while [ "$#" -gt 0 ]; do
+        parse_native_decoration_option "$1" \
+          || die 'usage: chatgpt update [--native-window-decoration|--no-native-window-decoration]'
+        shift
+      done
       update_app
       ;;
     --help|-h)
       chatgpt_usage
       ;;
+    --native-window-decoration|--no-native-window-decoration)
+      die 'decoration options can only be used with `chatgpt update`'
+      ;;
     *)
+      [ -z "$NATIVE_DECORATION_OVERRIDE" ] \
+        || die 'decoration options can only be used with `chatgpt update`'
       exec "$APP_ROOT/run-chatgpt" "$@"
       ;;
   esac
@@ -441,35 +586,75 @@ run_chatgpt() {
 
 resolve_self_path
 
+INSTALLER_ACTION=install
+INSTALL_DIRECTORY=
+
+parse_installer_arguments() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --help|-h)
+        [ "$INSTALLER_ACTION" = install ] || die 'conflicting installer options'
+        INSTALLER_ACTION=help
+        ;;
+      --check)
+        [ "$INSTALLER_ACTION" = install ] || die 'conflicting installer options'
+        INSTALLER_ACTION=check
+        ;;
+      --native-window-decoration|--no-native-window-decoration)
+        [ "$INSTALLER_ACTION" = install ] || die 'conflicting installer options'
+        parse_native_decoration_option "$1"
+        ;;
+      --directory)
+        [ "$INSTALLER_ACTION" = install ] || die 'conflicting installer options'
+        shift
+        [ "$#" -gt 0 ] || die 'missing directory after --directory'
+        [ -z "$INSTALL_DIRECTORY" ] || die 'installation directory was specified more than once'
+        INSTALL_DIRECTORY=$1
+        ;;
+      --)
+        shift
+        [ "$#" -eq 1 ] || die 'provide one directory after --'
+        [ -z "$INSTALL_DIRECTORY" ] || die 'installation directory was specified more than once'
+        INSTALL_DIRECTORY=$1
+        ;;
+      -*)
+        die "unknown installer option: $1"
+        ;;
+      *)
+        [ "$INSTALLER_ACTION" = install ] || die 'conflicting installer options'
+        [ -z "$INSTALL_DIRECTORY" ] || die 'installation directory was specified more than once'
+        INSTALL_DIRECTORY=$1
+        ;;
+    esac
+    shift
+  done
+}
+
 if [ "${0##*/}" = chatgpt ]; then
   run_chatgpt "$@"
   exit 0
 fi
 
-case "${1-}" in
-  --help|-h)
+parse_installer_arguments "$@"
+
+case "$INSTALLER_ACTION" in
+  help)
     usage
     ;;
-  --check)
-    [ "$#" -eq 1 ] || die 'usage: install-codex-app.sh --check'
+  check)
     check_architecture
     require_host_tools || exit 1
     check_host_libraries || exit 1
     check_desktop_helpers || exit 1
     printf '%s\n' 'Host checks passed. The downloaded DEB will be checked again after extraction.'
     ;;
-  --directory)
-    [ "$#" -eq 2 ] || die 'usage: install-codex-app.sh --directory DIRECTORY'
-    install_app "$2"
-    ;;
-  '')
-    printf 'Install directory [%s]: ' "$DEFAULT_ROOT"
-    IFS= read -r selected_root || exit 1
-    [ -n "$selected_root" ] || selected_root=$DEFAULT_ROOT
-    install_app "$selected_root"
-    ;;
-  *)
-    [ "$#" -eq 1 ] || die 'provide one directory, or use --help'
-    install_app "$1"
-    ;;
+  install)
+    if [ -n "$INSTALL_DIRECTORY" ]; then
+      install_app "$INSTALL_DIRECTORY"
+    else
+      printf 'Install directory [%s]: ' "$DEFAULT_ROOT"
+      IFS= read -r selected_root || exit 1
+      [ -n "$selected_root" ] || selected_root=$DEFAULT_ROOT
+      install_app "$selected_root"
+    fi
 esac

@@ -17,6 +17,7 @@ The package is currently distributed as an `amd64` Debian package. This installe
 - Preserves the local application profile and login data during updates
 - Creates a user-level desktop launcher
 - Leaves an existing system or user `codex` CLI installation unchanged
+- Optionally enables native system window decorations on Linux
 
 ## Requirements
 
@@ -37,11 +38,29 @@ The desktop app includes its own Codex runtime. A separate `codex` command is no
 
 ## Installation
 
-Download this repository or copy `install-codex-app.sh`, then run:
+Download this repository, then run the installer from the repository directory:
 
 ```bash
 chmod +x install-codex-app.sh
 ./install-codex-app.sh
+```
+
+The installer asks whether ChatGPT should use native system window decorations:
+
+```text
+Use native system window decorations for ChatGPT? [y/N]:
+```
+
+Answer `y` to enable the optional patch. The patch is applied after the
+application payload is installed and after every `chatgpt update`. Answering
+Enter or `n` leaves ChatGPT's default decorations unchanged. The preference is
+stored in `~/.config/chatgpt/install.conf`.
+
+Use an option to skip the prompt:
+
+```bash
+./install-codex-app.sh --native-window-decoration --directory "$HOME/Apps/chatgpt-linux"
+./install-codex-app.sh --no-native-window-decoration --directory "$HOME/Apps/chatgpt-linux"
 ```
 
 The script asks where to install the application. Press Enter to accept the default:
@@ -86,6 +105,15 @@ Update the local installation:
 chatgpt update
 ```
 
+Override the stored preference for a particular update:
+
+```bash
+chatgpt update --native-window-decoration
+chatgpt update --no-native-window-decoration
+```
+
+The override is saved and becomes the preference used by later updates.
+
 ChatGPT must be closed before updating. The update downloads the latest package, validates it, replaces only the application payload, and keeps the local profile directory.
 
 Show command help:
@@ -103,8 +131,10 @@ The installer creates these user-level files:
   usr/                    Extracted application payload
   user-data/              Electron profile and session data
   run-chatgpt              Local application launcher
+  patch-native-decoration.py  Optional native-decoration patch, when enabled
 
 ~/.local/bin/chatgpt      Open and update command
+~/.local/bin/patch-native-decoration.py  Patch helper for update overrides
 ~/.config/chatgpt/install.conf
 ~/.local/share/applications/chatgpt-local.desktop
 ```
@@ -126,6 +156,9 @@ The Debian package's installation scripts are intentionally not executed. This a
 - Only `amd64` / `x86_64` is supported by the current package URL.
 - Host GUI libraries are still required; the application payload is self-contained, not a complete Linux system image.
 - The updater requires ChatGPT to be closed.
+- The native-decoration option requires `python3` and is matched to the
+  packaged ChatGPT bundle; if an update changes the relevant Electron code,
+  the installer refuses to apply an unsafe patch.
 - The desktop launcher uses the chosen installation path, so moving the application directory manually requires reinstalling or updating the launcher configuration.
 
 ## License
