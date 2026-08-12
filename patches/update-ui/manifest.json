@@ -1,0 +1,10 @@
+{
+  "id": "update-ui",
+  "name": "Update Menu",
+  "version": "1.0.0",
+  "entry": "main.js",
+  "enabled": false,
+  "apiVersion": 1,
+  "applicationVersions": ["42.3.0"],
+  "electronVersions": ["42.3.0"]
+}

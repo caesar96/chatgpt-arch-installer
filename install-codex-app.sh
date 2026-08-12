@@ -9,6 +9,8 @@ COMMAND_PATH=$HOME/.local/bin/chatgpt
 DEFAULT_ROOT=$HOME/Apps/chatgpt-linux
 NATIVE_DECORATION_PATCH=patch-native-decoration.py
 NATIVE_DECORATION_OVERRIDE=
+PATCHES=
+INSTALLED_PACKAGE_VERSION=
 
 die() {
   printf 'chatgpt: %s\n' "$*" >&2
@@ -30,10 +32,13 @@ usage() {
 
 chatgpt_usage() {
   printf '%s\n' \
-    'Usage: chatgpt [update [DECORATION_OPTION]]' \
+    'Usage: chatgpt [--no-patches] [update [DECORATION_OPTION]]' \
     '  chatgpt         Open ChatGPT in the current terminal directory' \
     '  chatgpt update  Download and install the latest app version' \
-    '  DECORATION_OPTION: --native-window-decoration or --no-native-window-decoration'
+    '  chatgpt patches [list|status|enable NAME|disable NAME]' \
+    '  chatgpt --no-patches  Launch once without external patches' \
+    '  DECORATION_OPTION: --native-window-decoration or --no-native-window-decoration' \
+    '  NAME: native-decoration or update-ui'
 }
 
 resolve_self_path() {
@@ -64,7 +69,7 @@ check_architecture() {
 
 require_host_tools() {
   missing_tools=
-  for tool in curl ar tar xz mktemp ldd ldconfig awk readlink cp chmod mkdir mv dirname basename id uname pwd rm ls xdg-open xdg-mime; do
+  for tool in curl ar tar xz mktemp ldd ldconfig awk sort sed readlink cp chmod mkdir mv dirname basename id uname pwd rm ls xdg-open xdg-mime; do
     if ! command -v "$tool" >/dev/null 2>&1; then
       missing_tools="$missing_tools $tool"
     fi
@@ -268,6 +273,51 @@ extract_control() {
   esac
 }
 
+read_package_metadata() {
+  PACKAGE_PATH=$1
+  archive_members=$(ar t "$PACKAGE_PATH" 2>/dev/null || true)
+  CONTROL_ARCHIVE=
+  DATA_ARCHIVE=
+  for archive_member in $archive_members; do
+    case "$archive_member" in
+      control.tar.xz|control.tar.gz) CONTROL_ARCHIVE=$archive_member ;;
+      data.tar.xz|data.tar.gz) DATA_ARCHIVE=$archive_member ;;
+    esac
+  done
+  [ -n "$CONTROL_ARCHIVE" ] || die 'package has no supported control archive'
+  [ -n "$DATA_ARCHIVE" ] || die 'package has no supported data archive'
+
+  control=$(extract_control) || die 'could not read package metadata'
+  package_name=$(printf '%s\n' "$control" | awk -F': *' '$1 == "Package" {print $2; exit}')
+  package_architecture=$(printf '%s\n' "$control" | awk -F': *' '$1 == "Architecture" {print $2; exit}')
+  package_version=$(printf '%s\n' "$control" | awk -F': *' '$1 == "Version" {print $2; exit}')
+  [ "$package_name" = chatgpt ] || die "unexpected package: ${package_name:-unknown}"
+  [ "$package_architecture" = amd64 ] || die "unexpected package architecture: ${package_architecture:-unknown}"
+  [ -n "$package_version" ] || die 'package has no version'
+}
+
+download_latest_package() {
+  package_destination=$1
+  quiet_download=${2-}
+  if [ "$quiet_download" = quiet ]; then
+    curl --fail --location --retry 3 --retry-delay 2 --silent --show-error \
+      --output "$package_destination" "$PACKAGE_URL"
+  else
+    curl --fail --location --retry 3 --retry-delay 2 --progress-bar \
+      --output "$package_destination" "$PACKAGE_URL"
+  fi
+}
+
+version_is_newer() {
+  candidate_version=$1
+  installed_version=$2
+  [ -n "$candidate_version" ] || return 1
+  [ -n "$installed_version" ] || return 0
+  [ "$candidate_version" != "$installed_version" ] || return 1
+  newest_version=$(printf '%s\n%s\n' "$candidate_version" "$installed_version" | sort -V | awk 'END {print}')
+  [ "$newest_version" = "$candidate_version" ]
+}
+
 extract_data() {
   case "$DATA_ARCHIVE" in
     *.tar.xz) ar p "$PACKAGE_PATH" "$DATA_ARCHIVE" | tar -xJf - -C "$EXTRACTED_PATH" ;;
@@ -296,21 +346,108 @@ write_run_launcher() {
     '#!/bin/sh' \
     'set -eu' \
     'APP_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)' \
+    'export CHATGPT_APP_ROOT="$APP_ROOT"' \
+    'if [ -r "$APP_ROOT/usr/lib/chatgpt/version" ]; then export CHATGPT_APP_VERSION=$(awk "NR==1 {print; exit}" "$APP_ROOT/usr/lib/chatgpt/version"); fi' \
+    'CONFIG_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/chatgpt/install.conf' \
+    'if [ -r "$CONFIG_FILE" ]; then export CHATGPT_PATCHES=$(awk -F= '\''$1 == "patches" {print $2; exit}'\'' "$CONFIG_FILE"); fi' \
+    'if [ -r "$CONFIG_FILE" ]; then export CHATGPT_NATIVE_DECORATIONS=$(awk -F= '\''$1 == "native_decorations" {print $2; exit}'\'' "$CONFIG_FILE"); fi' \
+    'if [ "${CHATGPT_NO_PATCHES-0}" != 1 ] && [ -n "${CHATGPT_PATCHES-}" ]; then' \
+    '  export CHATGPT_PATCH_ROOT="$APP_ROOT/external"' \
+    '  export NODE_OPTIONS="${NODE_OPTIONS-} --require=$APP_ROOT/external/runtime/patch-loader.js"' \
+    'fi' \
     'exec "$APP_ROOT/usr/lib/chatgpt/ChatGPT" \' \
     '  --user-data-dir="$APP_ROOT/user-data" \' \
     '  "$@"' > "$launcher_path"
   chmod u+x "$launcher_path"
 }
 
+set_patch_enabled() {
+  patch_id=$1
+  requested_state=$2
+  case "$patch_id" in
+    native-decoration|update-ui) ;;
+    *) die "unknown patch: $patch_id" ;;
+  esac
+
+  case "$requested_state" in
+    enable)
+      case ",$PATCHES," in *,"$patch_id",*) ;; *) PATCHES=${PATCHES:+$PATCHES,}$patch_id ;; esac
+      ;;
+    disable)
+      PATCHES=$(printf '%s' ",$PATCHES," | awk -v p=",$patch_id," '{gsub(p,","); gsub(/^,|,$/,""); gsub(/,,+/,","); print}')
+      ;;
+  esac
+
+  if [ "$patch_id" = native-decoration ]; then
+    if [ "$requested_state" = enable ]; then
+      require_native_decoration_tools
+      python3 "$APP_ROOT/$NATIVE_DECORATION_PATCH" --apply \
+        || die 'native decoration patch could not be applied; restart ChatGPT after fixing the reported build issue'
+      NATIVE_DECORATIONS=1
+    else
+      python3 "$APP_ROOT/$NATIVE_DECORATION_PATCH" --restore \
+        || die 'native decoration patch could not be restored'
+      NATIVE_DECORATIONS=0
+    fi
+  fi
+  write_config
+  printf 'Patch %s %sd. Restart ChatGPT for the change to take effect.\n' "$patch_id" "$requested_state"
+}
+
+write_installed_cli() {
+  cli_source="$INSTALLER_DIRECTORY/templates/chatgpt"
+  if [ ! -r "$cli_source" ]; then
+    cli_source="$APP_ROOT/external/templates/chatgpt"
+  fi
+  [ -r "$cli_source" ] || die "installed CLI template is missing: $cli_source"
+  cli_temporary="$APP_ROOT/cli.$$"
+  cli_root=$(printf '%s' "$APP_ROOT" | sed "s/'/'\\\\''/g" | sed 's/[\\&|]/\\&/g')
+  sed "s|__CHATGPT_APP_ROOT__|$cli_root|" "$cli_source" > "$cli_temporary"
+  chmod u+x "$cli_temporary"
+  mv -f "$cli_temporary" "$COMMAND_PATH"
+}
+
+copy_external_files() {
+  external_source="$INSTALLER_DIRECTORY"
+  if [ ! -r "$external_source/runtime/patch-loader.js" ]; then
+    external_source="$APP_ROOT/external"
+  fi
+  external_temporary="$APP_ROOT/.external.$$"
+  rm -rf "$external_temporary"
+  mkdir -p "$external_temporary/runtime" "$external_temporary/patches" "$external_temporary/templates"
+  cp "$external_source/runtime/patch-loader.js" "$external_temporary/runtime/patch-loader.js"
+  cp "$external_source/runtime/update-from-menu.sh" "$external_temporary/runtime/update-from-menu.sh"
+  cp "$external_source/runtime/toggle-native-decoration.sh" "$external_temporary/runtime/toggle-native-decoration.sh"
+  cp "$external_source/patch-native-decoration.py" "$external_temporary/patch-native-decoration.py"
+  cp -a "$external_source/patches/native-decoration" "$external_temporary/patches/"
+  cp -a "$external_source/patches/update-ui" "$external_temporary/patches/"
+  cp "$external_source/templates/chatgpt" "$external_temporary/templates/chatgpt"
+  chmod 644 "$external_temporary/runtime/patch-loader.js" "$external_temporary/patches"/*/*.js "$external_temporary/patches"/*/*.json
+  chmod 755 "$external_temporary/patch-native-decoration.py"
+  chmod 755 "$external_temporary/runtime/update-from-menu.sh"
+  chmod 755 "$external_temporary/runtime/toggle-native-decoration.sh"
+  if [ -e "$APP_ROOT/external" ]; then
+    mv "$APP_ROOT/external" "$backup_external" \
+      || die 'could not back up the existing external patch files'
+  fi
+  if ! mv "$external_temporary" "$APP_ROOT/external"; then
+    rm -rf "$external_temporary"
+    [ ! -e "$backup_external" ] || mv "$backup_external" "$APP_ROOT/external" || true
+    die 'could not install the external patch files'
+  fi
+  external_replaced=1
+}
+
 write_native_decoration_patch() {
   patch_source=
   if [ -r "$INSTALLER_DIRECTORY/$NATIVE_DECORATION_PATCH" ]; then
     patch_source=$INSTALLER_DIRECTORY/$NATIVE_DECORATION_PATCH
+  elif [ -r "$APP_ROOT/external/$NATIVE_DECORATION_PATCH" ]; then
+    patch_source=$APP_ROOT/external/$NATIVE_DECORATION_PATCH
   elif [ -r "$APP_ROOT/$NATIVE_DECORATION_PATCH" ]; then
     patch_source=$APP_ROOT/$NATIVE_DECORATION_PATCH
   fi
   if [ -z "$patch_source" ]; then
-    [ "$NATIVE_DECORATIONS" -eq 0 ] && return 0
     printf 'chatgpt: native decoration patch script is missing: %s\n' "$NATIVE_DECORATION_PATCH" >&2
     return 1
   fi
@@ -334,7 +471,7 @@ write_config() {
   config_directory=$(dirname -- "$CONFIG_FILE")
   mkdir -p "$config_directory"
   config_temporary="$CONFIG_FILE.$$"
-  printf '%s\n' "$APP_ROOT" "native_decorations=$NATIVE_DECORATIONS" > "$config_temporary"
+  printf '%s\n' "$APP_ROOT" "native_decorations=$NATIVE_DECORATIONS" "patches=$PATCHES" "package_version=${INSTALLED_PACKAGE_VERSION-}" > "$config_temporary"
   chmod 600 "$config_temporary"
   mv -f "$config_temporary" "$CONFIG_FILE"
 }
@@ -342,10 +479,11 @@ write_config() {
 write_command_copy() {
   command_directory=$(dirname -- "$COMMAND_PATH")
   mkdir -p "$command_directory"
-  command_temporary="$COMMAND_PATH.$$"
-  cp "$SELF_PATH" "$command_temporary"
-  chmod u+x "$command_temporary"
-  mv -f "$command_temporary" "$COMMAND_PATH"
+  write_installed_cli
+  installer_temporary="$APP_ROOT/installer.$$"
+  cp "$SELF_PATH" "$installer_temporary"
+  chmod u+x "$installer_temporary"
+  mv -f "$installer_temporary" "$APP_ROOT/installer"
   patch_source="$INSTALLER_DIRECTORY/$NATIVE_DECORATION_PATCH"
   if [ -r "$patch_source" ]; then
     patch_destination="$command_directory/$NATIVE_DECORATION_PATCH"
@@ -366,7 +504,7 @@ write_desktop_entry() {
     'Name=ChatGPT' \
     'Comment=ChatGPT by OpenAI' \
     'GenericName=AI assistant' \
-    "Exec=\"$APP_ROOT/run-chatgpt\" %U" \
+    "Exec=\"$COMMAND_PATH\" %U" \
     "Icon=$APP_ROOT/usr/share/pixmaps/chatgpt.png" \
     'Type=Application' \
     'Terminal=false' \
@@ -402,39 +540,58 @@ report_command_path() {
 }
 
 install_payload() {
+  supplied_package=${1-}
   temporary_root=$(mktemp -d "$APP_ROOT/.install.XXXXXXXX") \
     || die "cannot create a temporary directory inside $APP_ROOT"
-  PACKAGE_PATH="$temporary_root/$PACKAGE_NAME"
   EXTRACTED_PATH="$temporary_root/extracted"
+  backup_usr="$temporary_root/original-usr"
+  backup_external="$temporary_root/original-external"
+  payload_replaced=0
+  external_replaced=0
+  payload_install_succeeded=0
+
+  rollback_payload() {
+    if [ "$external_replaced" -eq 1 ]; then
+      failed_external="$temporary_root/failed-external"
+      if [ -e "$APP_ROOT/external" ]; then
+        mv "$APP_ROOT/external" "$failed_external" || true
+      fi
+      if [ -e "$backup_external" ]; then
+        mv "$backup_external" "$APP_ROOT/external" || true
+      fi
+      external_replaced=0
+    fi
+    if [ "$payload_replaced" -eq 1 ]; then
+      failed_usr="$temporary_root/failed-usr"
+      if [ -e "$APP_ROOT/usr" ]; then
+        mv "$APP_ROOT/usr" "$failed_usr" || true
+      fi
+      if [ -e "$backup_usr" ]; then
+        mv "$backup_usr" "$APP_ROOT/usr" || true
+      fi
+      payload_replaced=0
+    fi
+  }
 
   cleanup() {
+    if [ "$payload_install_succeeded" -ne 1 ]; then
+      rollback_payload
+    fi
     rm -rf "$temporary_root"
   }
   trap cleanup EXIT INT TERM
 
-  printf '%s\n' 'Downloading latest ChatGPT package...'
-  curl --fail --location --retry 3 --retry-delay 2 --progress-bar \
-    --output "$PACKAGE_PATH" "$PACKAGE_URL" \
-    || die 'download failed'
+  if [ -n "$supplied_package" ]; then
+    PACKAGE_PATH=$supplied_package
+    [ -r "$PACKAGE_PATH" ] || die "package file is not readable: $PACKAGE_PATH"
+  else
+    PACKAGE_PATH="$temporary_root/$PACKAGE_NAME"
+    printf '%s\n' 'Downloading latest ChatGPT package...'
+    download_latest_package "$PACKAGE_PATH" || die 'download failed'
+  fi
 
-  archive_members=$(ar t "$PACKAGE_PATH" 2>/dev/null || true)
-  CONTROL_ARCHIVE=
-  DATA_ARCHIVE=
-  for archive_member in $archive_members; do
-    case "$archive_member" in
-      control.tar.xz|control.tar.gz) CONTROL_ARCHIVE=$archive_member ;;
-      data.tar.xz|data.tar.gz) DATA_ARCHIVE=$archive_member ;;
-    esac
-  done
-  [ -n "$CONTROL_ARCHIVE" ] || die 'downloaded package has no supported control archive'
-  [ -n "$DATA_ARCHIVE" ] || die 'downloaded package has no supported data archive'
-
-  control=$(extract_control) || die 'could not read package metadata'
-  package_name=$(printf '%s\n' "$control" | awk -F': *' '$1 == "Package" {print $2; exit}')
-  package_architecture=$(printf '%s\n' "$control" | awk -F': *' '$1 == "Architecture" {print $2; exit}')
-  package_version=$(printf '%s\n' "$control" | awk -F': *' '$1 == "Version" {print $2; exit}')
-  [ "$package_name" = chatgpt ] || die "unexpected package: ${package_name:-unknown}"
-  [ "$package_architecture" = amd64 ] || die "unexpected package architecture: ${package_architecture:-unknown}"
+  read_package_metadata "$PACKAGE_PATH"
+  INSTALLED_PACKAGE_VERSION=$package_version
   printf 'Package: %s %s\n' "$package_name" "$package_version"
 
   mkdir "$EXTRACTED_PATH"
@@ -447,7 +604,6 @@ install_payload() {
   [ -f "$EXTRACTED_PATH/usr/share/pixmaps/chatgpt.png" ] \
     || die 'downloaded package does not contain the application icon'
 
-  backup_usr="$temporary_root/original-usr"
   if [ -e "$APP_ROOT/usr" ]; then
     mv "$APP_ROOT/usr" "$backup_usr" \
       || die 'could not prepare the current installation for replacement'
@@ -456,29 +612,21 @@ install_payload() {
     [ ! -e "$backup_usr" ] || mv "$backup_usr" "$APP_ROOT/usr" || true
     die 'could not install the downloaded application files'
   fi
+  payload_replaced=1
   rm -rf "$APP_ROOT/etc" "$APP_ROOT/var"
   [ ! -e "$EXTRACTED_PATH/etc" ] || cp -a "$EXTRACTED_PATH/etc" "$APP_ROOT/etc"
   [ ! -e "$EXTRACTED_PATH/var" ] || cp -a "$EXTRACTED_PATH/var" "$APP_ROOT/var"
   mkdir -p "$APP_ROOT/user-data"
+  copy_external_files
+  write_native_decoration_patch || die 'could not install the native decoration patch helper'
   launcher_temporary="$temporary_root/run-chatgpt"
   write_run_launcher "$launcher_temporary"
   mv -f "$launcher_temporary" "$APP_ROOT/run-chatgpt"
-  rollback_payload() {
-    failed_usr="$temporary_root/failed-usr"
-    if [ -e "$APP_ROOT/usr" ]; then
-      mv "$APP_ROOT/usr" "$failed_usr" || true
-    fi
-    if [ -e "$backup_usr" ]; then
-      mv "$backup_usr" "$APP_ROOT/usr" || true
-    fi
-  }
   if [ "$NATIVE_DECORATIONS" -eq 1 ]; then
     if ! write_native_decoration_patch || ! apply_native_decoration_patch; then
       rollback_payload
       die 'could not apply the native window decoration patch; the previous payload was restored'
     fi
-  else
-    rm -f "$APP_ROOT/$NATIVE_DECORATION_PATCH"
   fi
   printf 'Application payload installed in %s.\n' "$APP_ROOT"
 }
@@ -498,6 +646,28 @@ load_configured_root() {
     0|1) ;;
     *) die "invalid native decoration setting in $CONFIG_FILE" ;;
   esac
+  PATCHES=$(awk -F= '$1 == "patches" {print $2; exit}' "$CONFIG_FILE")
+  INSTALLED_PACKAGE_VERSION=$(awk -F= '$1 == "package_version" {print $2; exit}' "$CONFIG_FILE")
+  if [ -z "$INSTALLED_PACKAGE_VERSION" ] \
+    && [ -r "$APP_ROOT/usr/lib/chatgpt/resources/linux-package-metadata.json" ]; then
+    INSTALLED_PACKAGE_VERSION=$(awk -F'"' '$2 == "version" {print $4; exit}' \
+      "$APP_ROOT/usr/lib/chatgpt/resources/linux-package-metadata.json")
+  fi
+  patches_setting=$(awk -F= '$1 == "patches" {print "present"; exit}' "$CONFIG_FILE")
+  if [ -z "$patches_setting" ]; then
+    PATCHES=update-ui
+    if [ "$NATIVE_DECORATIONS" -eq 1 ]; then
+      PATCHES=$PATCHES,native-decoration
+    elif [ -x "$APP_ROOT/$NATIVE_DECORATION_PATCH" ] && command -v python3 >/dev/null 2>&1; then
+      native_patch_status=$(python3 "$APP_ROOT/$NATIVE_DECORATION_PATCH" --status 2>/dev/null || true)
+      case "$native_patch_status" in
+        *'Native decoration patch: applied'*)
+          NATIVE_DECORATIONS=1
+          PATCHES=$PATCHES,native-decoration
+          ;;
+      esac
+    fi
+  fi
 }
 
 finish_install() {
@@ -523,11 +693,14 @@ install_app() {
   check_host_libraries || exit 1
   check_desktop_helpers || exit 1
   ask_native_decoration_preference
+  PATCHES=update-ui
+  [ "$NATIVE_DECORATIONS" -eq 0 ] || PATCHES=$PATCHES,native-decoration
   resolve_install_root "$1"
   require_native_decoration_tools
   prepare_install_root
   install_payload
   finish_install
+  payload_install_succeeded=1
 }
 
 update_app() {
@@ -538,16 +711,71 @@ update_app() {
   load_configured_root
   if [ -n "$NATIVE_DECORATION_OVERRIDE" ]; then
     NATIVE_DECORATIONS=$NATIVE_DECORATION_OVERRIDE
+    if [ "$NATIVE_DECORATIONS" -eq 1 ]; then
+      case ",$PATCHES," in *,native-decoration,*) ;; *) PATCHES=${PATCHES:+$PATCHES,}native-decoration ;; esac
+    else
+      PATCHES=$(printf '%s' ",$PATCHES," | awk -v p=",native-decoration," '{gsub(p,""); gsub(/^,|,$/,""); gsub(/,,+/,","); print}')
+    fi
   fi
   require_native_decoration_tools
   is_running_at "$APP_ROOT" && die 'close ChatGPT before updating it'
   install_payload
   finish_install
+  payload_install_succeeded=1
+}
+
+check_update_app() {
+  check_architecture
+  require_host_tools || exit 1
+
+  update_cache_directory=$APP_ROOT/update-cache
+  mkdir -p "$update_cache_directory" \
+    || die "cannot create update cache: $update_cache_directory"
+  package_temporary="$update_cache_directory/$PACKAGE_NAME.$$"
+  package_cached="$update_cache_directory/$PACKAGE_NAME"
+  cleanup_update_package() {
+    [ -z "${package_temporary-}" ] || rm -f "$package_temporary"
+  }
+  trap cleanup_update_package EXIT INT TERM
+
+  download_latest_package "$package_temporary" quiet \
+    || die 'download failed'
+  read_package_metadata "$package_temporary"
+  if version_is_newer "$package_version" "$INSTALLED_PACKAGE_VERSION"; then
+    mv -f "$package_temporary" "$package_cached" \
+      || die 'could not save the downloaded update'
+    package_temporary=
+    printf '%s\n' 'status=update-available'
+    printf 'installed-version=%s\n' "${INSTALLED_PACKAGE_VERSION:-unknown}"
+    printf 'available-version=%s\n' "$package_version"
+    printf 'package-path=%s\n' "$package_cached"
+  else
+    rm -f "$package_temporary" "$package_cached"
+    package_temporary=
+    printf '%s\n' 'status=up-to-date'
+    printf 'installed-version=%s\n' "${INSTALLED_PACKAGE_VERSION:-unknown}"
+    printf 'available-version=%s\n' "$package_version"
+  fi
+}
+
+install_package_app() {
+  package_path=$1
+  check_architecture
+  require_host_tools || exit 1
+  check_host_libraries || exit 1
+  check_desktop_helpers || exit 1
+  require_native_decoration_tools
+  is_running_at "$APP_ROOT" && die 'close ChatGPT before updating it'
+  install_payload "$package_path"
+  finish_install
+  payload_install_succeeded=1
 }
 
 run_chatgpt() {
+  NO_PATCHES=0
   if [ "$#" -gt 0 ]; then
     case "$1" in
+      --no-patches) NO_PATCHES=1; shift ;;
       --native-window-decoration|--no-native-window-decoration)
         parse_native_decoration_option "$1"
         shift
@@ -555,11 +783,16 @@ run_chatgpt() {
     esac
   fi
   load_configured_root
+  export CHATGPT_PATCHES=$PATCHES
+  export CHATGPT_APP_ROOT=$APP_ROOT
   case "${1-}" in
     '')
       [ -z "$NATIVE_DECORATION_OVERRIDE" ] \
         || die 'decoration options can only be used with `chatgpt update`'
-      exec "$APP_ROOT/run-chatgpt" --open-project "$PWD"
+       if [ "$NO_PATCHES" -eq 1 ]; then export CHATGPT_NO_PATCHES=1; fi
+       export CHATGPT_PATCHES=$PATCHES
+       export CHATGPT_APP_ROOT=$APP_ROOT
+       exec "$APP_ROOT/run-chatgpt" --open-project "$PWD"
       ;;
     update)
       shift
@@ -569,6 +802,27 @@ run_chatgpt() {
         shift
       done
       update_app
+      ;;
+    check-update)
+      [ "$#" -eq 1 ] || die 'usage: chatgpt check-update'
+      check_update_app
+      ;;
+    install-package)
+      [ "$#" -eq 2 ] || die 'usage: chatgpt install-package PACKAGE'
+      install_package_app "$2"
+      ;;
+    patches)
+      [ "$NO_PATCHES" -eq 0 ] || die '--no-patches cannot be used with patch management'
+      shift
+      case "${1-}" in
+        list) printf '%s\n' 'native-decoration' 'update-ui' ;;
+        status) printf 'Enabled patches: %s\n' "${PATCHES:-none}" ;;
+         enable|disable)
+           [ "$#" -eq 2 ] || die 'usage: chatgpt patches enable|disable NAME'
+           set_patch_enabled "$2" "$1"
+           ;;
+        *) die 'usage: chatgpt patches list|status|enable NAME|disable NAME' ;;
+      esac
       ;;
     --help|-h)
       chatgpt_usage
@@ -630,7 +884,7 @@ parse_installer_arguments() {
   done
 }
 
-if [ "${0##*/}" = chatgpt ]; then
+if [ "${0##*/}" = chatgpt ] || [ "${0##*/}" = installer ]; then
   run_chatgpt "$@"
   exit 0
 fi

@@ -1,0 +1,28 @@
+#!/bin/sh
+set -eu
+APP_ROOT='__CHATGPT_APP_ROOT__'
+export CHATGPT_CLI_PATH=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/$(basename -- "$0")
+PATCH_ROOT=$APP_ROOT/external
+CONFIG_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/chatgpt/install.conf
+PATCHES=$(awk -F= '$1 == "patches" {print $2; exit}' "$CONFIG_FILE" 2>/dev/null || true)
+export CHATGPT_PATCHES=$PATCHES
+NATIVE_DECORATIONS=$(awk -F= '$1 == "native_decorations" {print $2; exit}' "${XDG_CONFIG_HOME:-$HOME/.config}/chatgpt/install.conf" 2>/dev/null || true)
+export CHATGPT_NATIVE_DECORATIONS=${NATIVE_DECORATIONS:-0}
+if [ "${1-}" = --no-patches ]; then
+  export CHATGPT_NO_PATCHES=1
+  shift
+fi
+if [ "${1-}" = --help ] || [ "${1-}" = -h ]; then
+  exec "$APP_ROOT/installer" --help
+fi
+if [ "${1-}" = update ] || [ "${1-}" = patches ] || [ "${1-}" = check-update ] || [ "${1-}" = install-package ] || [ "${1-}" = --native-window-decoration ] || [ "${1-}" = --no-native-window-decoration ]; then
+  exec "$APP_ROOT/installer" "$@"
+fi
+if [ "${CHATGPT_NO_PATCHES-0}" != 1 ] && [ -n "$PATCHES" ]; then
+  export CHATGPT_PATCH_ROOT=$PATCH_ROOT
+  export NODE_OPTIONS="${NODE_OPTIONS-} --require=$PATCH_ROOT/runtime/patch-loader.js"
+fi
+if [ "$#" -eq 0 ]; then
+  exec "$APP_ROOT/run-chatgpt" --open-project "$PWD"
+fi
+exec "$APP_ROOT/run-chatgpt" "$@"
