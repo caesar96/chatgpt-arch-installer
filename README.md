@@ -103,16 +103,6 @@ The installer creates these user-level files:
 
 The installer does not write to `/usr`, `/opt`, `/etc`, or system package databases.
 
-## Live ISO Testing
-
-On a CachyOS live ISO, install or copy the script and run the dependency check first:
-
-```bash
-./install-codex-app.sh --check
-```
-
-If it reports missing tools or libraries, install the corresponding packages in the live session and run the check again. The live environment is temporary, so the installation and login profile will disappear after reboot unless the environment has persistence.
-
 ## Package Source
 
 The installer downloads the latest package from the official OpenAI CDN:
