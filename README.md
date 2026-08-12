@@ -72,6 +72,14 @@ chatgpt
 
 This is intended to behave like `code .`: it uses the desktop app's `--open-project` option.
 
+The command is installed at `~/.local/bin/chatgpt`. If the terminal reports `chatgpt: command not found`, add the user-local binary directory to the current shell:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Add the same line to `~/.bashrc` or `~/.zshrc` to make it persistent for future terminal sessions. The desktop menu launcher uses an absolute path and does not depend on `PATH`.
+
 Update the local installation:
 
 ```bash

@@ -289,6 +289,21 @@ write_desktop_entry() {
   fi
 }
 
+report_command_path() {
+  case ":${PATH:-}:" in
+    *":$HOME/.local/bin:"*)
+      printf '%s\n' 'The `chatgpt` command is available in the current PATH.'
+      ;;
+    *)
+      printf '%s\n' \
+        "The command was installed at $COMMAND_PATH, but $HOME/.local/bin is not in the current PATH." \
+        'For this terminal session, run:' \
+        '  export PATH="$HOME/.local/bin:$PATH"' \
+        'Add that export to ~/.bashrc or ~/.zshrc to make it persistent.'
+      ;;
+  esac
+}
+
 install_payload() {
   temporary_root=$(mktemp -d "$APP_ROOT/.install.XXXXXXXX") \
     || die "cannot create a temporary directory inside $APP_ROOT"
@@ -374,6 +389,7 @@ finish_install() {
     "Installed ChatGPT/Codex locally in $APP_ROOT" \
     "Command: $COMMAND_PATH" \
     'Run `chatgpt` to open the current directory, or `chatgpt update` to update.'
+  report_command_path
   if command -v codex >/dev/null 2>&1; then
     printf '%s\n' 'Existing codex CLI detected and left unchanged; the desktop app uses its bundled runtime.'
   else
