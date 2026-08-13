@@ -21,6 +21,7 @@ The package is currently distributed as an `amd64` Debian package. This installe
 - Optionally enables native system window decorations on Linux
 - Keeps optional patches outside the downloaded `app.asar`
 - Adds a themed `Help -> Check for Updates...` workflow without closing the app during the check
+- Checks for updates after launch without downloading the full package
 
 ## Requirements
 
@@ -33,7 +34,7 @@ The installer currently targets:
 
 The installer checks for these host tools:
 
-`curl`, `ar`, `tar`, `xz`, `mktemp`, `ldd`, `ldconfig`, `awk`, `sort`, `sed`, `readlink`, `xdg-open`, and `xdg-mime`.
+`curl`, `ar`, `tar`, `xz`, `mktemp`, `ldd`, `ldconfig`, `awk`, `sort`, `sed`, `tr`, `readlink`, `cat`, `date`, `dd`, `wc`, `xdg-open`, and `xdg-mime`.
 
 It also checks the GUI libraries required by the Electron application and verifies the dynamic dependencies of the bundled Electron and Codex executables. On CachyOS, these are normally provided by the standard desktop and multimedia packages.
 
@@ -125,6 +126,7 @@ same file. It then routes commands as follows:
 | `chatgpt` | Launches ChatGPT with `--open-project "$PWD"`. |
 | `chatgpt [APP_OPTIONS...]` | Launches ChatGPT with the supplied Electron/app arguments. |
 | `chatgpt update [OPTIONS...]` | Runs the app-local installer backend and replaces the application payload after ChatGPT is closed. |
+| `chatgpt check-update` | Checks remote package metadata without downloading the full `.deb`. |
 | `chatgpt patches ...` | Lists, reports, enables, or disables external patches. |
 | `chatgpt --no-patches [APP_OPTIONS...]` | Launches once without loading external patches. |
 | `chatgpt --help` | Shows the installed command help through the app-local backend. |
@@ -196,15 +198,22 @@ the downloaded application payload.
 - `Help -> Enable Native Window Decorations` or `Disable Native Window Decorations`
 
 The update item starts the app-local `installer check-update` command. That
-command downloads the latest package into `update-cache`, reads its Debian
-package metadata, and compares its version with `package_version` in
-`install.conf`. It does not replace files or close ChatGPT during this phase.
+command sends a conditional `HEAD` request using the saved `ETag`, then reads
+only the beginning of the Debian package with an HTTP Range request. It parses
+the small `control` archive and compares its `Version` with
+`package_version` in `install.conf`. It does not download the full package,
+replace files, or close ChatGPT during this phase.
+
+The patch also starts a quiet update check a few seconds after ChatGPT opens.
+Automatic checks are limited to once every 24 hours, ignore network errors, and
+show a dialog only when a newer version is found. Manual checks from the Help
+menu are immediate and still report the up-to-date or error state.
 
 The patch displays themed child windows parented to the main ChatGPT window.
 The progress window and result window are centered against the main window,
 stay above it, and follow the system light/dark appearance. An available
-update is offered as `Update Now` or `Later`; only `Update Now` starts
-`external/runtime/update-from-menu.sh`.
+update is offered as `Update Now` or `Later`; `Update Now` downloads the full
+package with progress and then starts `external/runtime/update-from-menu.sh`.
 
 #### `native-decoration`
 
@@ -227,14 +236,19 @@ ChatGPT must be closed before updating. The command-line update downloads the la
 `Help -> Check for Updates...` follows this sequence:
 
 1. Opens a progress window parented to and centered on the ChatGPT window.
-2. Downloads and inspects the latest `.deb` while ChatGPT remains open.
+2. Sends a conditional metadata request and reads only the package header/control data while ChatGPT remains open.
 3. Reports that ChatGPT is up to date without closing the app, or shows the installed and available versions.
 4. Offers `Update Now` and `Later` when an update is available.
-5. On `Update Now`, closes ChatGPT, installs the already-downloaded package, and relaunches the app after installation completes.
+5. On `Update Now`, opens a download progress window and downloads the full package in HTTP Range chunks.
+6. After the progress reaches 100%, closes ChatGPT, installs the package, and relaunches the app normally.
 
 The progress and result windows use native Electron child-window behavior, stay above the main window, and use the current light/dark system appearance. `Later` only closes the result window; it does not install anything.
 
-The menu update cache is stored under `<chosen-directory>/update-cache` during the confirmation step and is removed after a successful installation or when no update is available. Keep enough free space for the downloaded package and temporary extraction.
+The update metadata is stored under `<chosen-directory>/state/update-check.meta`.
+The full package is stored under `<chosen-directory>/update-cache` only after
+`Update Now` is selected. It is removed after a successful installation or when
+the downloaded package is no longer newer. Keep enough free space for the
+downloaded package and temporary extraction.
 
 Show command help:
 
@@ -259,8 +273,8 @@ The installer creates these user-level files:
   external/patches/native-decoration/main.js
   external/patches/update-ui/manifest.json
   external/patches/update-ui/main.js
-  update-cache/          Downloaded package awaiting confirmation
-  state/                  Menu update status and logs, after a menu action
+  update-cache/          Full package during an accepted update
+  state/                  Update metadata, status, and logs
   patch-native-decoration.py  Verified ASAR fallback, when enabled
 
 ~/.local/bin/chatgpt      Open and update command
@@ -290,17 +304,19 @@ The Debian package's installation scripts are intentionally not executed. This a
 
 - Only `amd64` / `x86_64` is supported by the current package URL.
 - Host GUI libraries are still required; the application payload is self-contained, not a complete Linux system image.
-- The installation backend requires ChatGPT to be closed while replacing the payload; the menu checker itself keeps ChatGPT open until `Update Now` is confirmed.
+- The installation backend requires ChatGPT to be closed while replacing the payload; the menu checker and downloader keep ChatGPT open until the download reaches 100%.
 - The native-decoration option requires `python3` and is matched to the
   packaged ChatGPT bundle; if an update changes the relevant Electron code,
   the installer refuses to apply an unsafe patch.
 - The external native-decoration module is intentionally passive for now; the
   verified exact-match ASAR patch remains the implementation because Electron
   does not provide a stable external main-process plugin API.
-- Enabling `update-ui` adds `Help -> Check for Updates...`; it downloads and
-  checks the package while ChatGPT remains open, then offers `Update Now` or
-  `Later` when an update is available. The menu patch is supported only for
-  the application/Electron versions in its manifest.
+- Enabling `update-ui` adds `Help -> Check for Updates...` and a throttled
+  startup check. Checks use `ETag`, HTTP Range, and Debian control metadata, so
+  they do not download the full package. Selecting `Update Now` downloads the
+  package with a progress dialog, then closes, updates, and relaunches ChatGPT.
+  The menu patch is supported only for the application/Electron versions in its
+  manifest.
 - New installations enable `update-ui` by default so the update and decoration
   controls are available immediately; `native-decoration` remains opt-in.
 - The current patch manifests are verified for ChatGPT/Electron compatibility

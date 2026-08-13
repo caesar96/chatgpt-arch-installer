@@ -3,6 +3,10 @@ set -eu
 
 PACKAGE_URL=${CHATGPT_PACKAGE_URL:-https://persistent.oaistatic.com/codex-app-prod/linux/deb/latest/chatgpt_amd64.deb}
 PACKAGE_NAME=chatgpt_amd64.deb
+AUTOMATIC_UPDATE_INTERVAL=86400
+METADATA_RANGE_INITIAL_END=65535
+METADATA_RANGE_MAX_END=4194303
+FULL_DOWNLOAD_CHUNK_SIZE=16777216
 CONFIG_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/chatgpt/install.conf
 DESKTOP_FILE=${XDG_DATA_HOME:-$HOME/.local/share}/applications/chatgpt-local.desktop
 COMMAND_PATH=$HOME/.local/bin/chatgpt
@@ -35,6 +39,7 @@ chatgpt_usage() {
     'Usage: chatgpt [--no-patches] [update [DECORATION_OPTION]]' \
     '  chatgpt         Open ChatGPT in the current terminal directory' \
     '  chatgpt update  Download and install the latest app version' \
+    '  chatgpt check-update  Check remote package metadata' \
     '  chatgpt patches [list|status|enable NAME|disable NAME]' \
     '  chatgpt --no-patches  Launch once without external patches' \
     '  DECORATION_OPTION: --native-window-decoration or --no-native-window-decoration' \
@@ -69,7 +74,7 @@ check_architecture() {
 
 require_host_tools() {
   missing_tools=
-  for tool in curl ar tar xz mktemp ldd ldconfig awk sort sed readlink cp chmod mkdir mv dirname basename id uname pwd rm ls xdg-open xdg-mime; do
+  for tool in curl ar tar xz mktemp ldd ldconfig awk sort sed tr readlink cp chmod mkdir mv dirname basename id uname pwd rm ls cat date dd wc xdg-open xdg-mime; do
     if ! command -v "$tool" >/dev/null 2>&1; then
       missing_tools="$missing_tools $tool"
     fi
@@ -316,6 +321,310 @@ version_is_newer() {
   [ "$candidate_version" != "$installed_version" ] || return 1
   newest_version=$(printf '%s\n%s\n' "$candidate_version" "$installed_version" | sort -V | awk 'END {print}')
   [ "$newest_version" = "$candidate_version" ]
+}
+
+read_header_value() {
+  header_file=$1
+  requested_header=$2
+  awk -v requested="$requested_header" '
+    BEGIN { requested=tolower(requested); value="" }
+    /^[[:space:]]*[^:]+:/ {
+      line=$0
+      sub(/^[[:space:]]*/, "", line)
+      separator=index(line, ":")
+      name=tolower(substr(line, 1, separator - 1))
+      if (name == requested) {
+        value=substr(line, separator + 1)
+        sub(/^[[:space:]]*/, "", value)
+        sub(/[[:space:]]*\r$/, "", value)
+      }
+    }
+    END { print value }
+  ' "$header_file"
+}
+
+read_http_status() {
+  awk '/^HTTP\/[0-9.]+[[:space:]]/ { status=$2 } END { print status }' "$1"
+}
+
+read_content_range_parts() {
+  content_range=$1
+  case "$content_range" in
+    bytes\ [0-9]*-[0-9]*/[0-9]*) ;;
+    *) return 1 ;;
+  esac
+  content_range=${content_range#bytes }
+  range_start=${content_range%%-*}
+  range_tail=${content_range#*-}
+  range_end=${range_tail%%/*}
+  range_total=${range_tail#*/}
+  case "$range_start:$range_end:$range_total" in
+    *[!0-9:]*|:*|*::*) return 1 ;;
+  esac
+}
+
+fetch_package_headers() {
+  update_headers_file=$1
+  rm -f "$update_headers_file"
+  if [ -n "${UPDATE_IF_NONE_MATCH-}" ]; then
+    curl --fail --silent --show-error --location --head \
+      --retry 3 --retry-delay 2 --connect-timeout 20 \
+      --dump-header "$update_headers_file" --output /dev/null \
+      -H "If-None-Match: $UPDATE_IF_NONE_MATCH" "$PACKAGE_URL" || return 1
+  else
+    curl --fail --silent --show-error --location --head \
+      --retry 3 --retry-delay 2 --connect-timeout 20 \
+      --dump-header "$update_headers_file" --output /dev/null \
+      "$PACKAGE_URL" || return 1
+  fi
+  update_http_status=$(read_http_status "$update_headers_file")
+  update_remote_etag=$(read_header_value "$update_headers_file" etag)
+  update_remote_last_modified=$(read_header_value "$update_headers_file" last-modified)
+  update_remote_content_length=$(read_header_value "$update_headers_file" content-length)
+  update_remote_accept_ranges=$(read_header_value "$update_headers_file" accept-ranges)
+}
+
+fetch_package_range_bounds() {
+  partial_file=$1
+  range_headers_file=$2
+  range_start_requested=$3
+  range_end_requested=$4
+  rm -f "$partial_file" "$range_headers_file"
+  if [ -n "${RANGE_EXPECTED_ETAG-}" ]; then
+    curl --fail --silent --show-error --location \
+      --retry 3 --retry-delay 2 --connect-timeout 20 \
+      --range "$range_start_requested-$range_end_requested" \
+      --max-filesize "$((range_end_requested - range_start_requested + 1))" \
+      --dump-header "$range_headers_file" --output "$partial_file" \
+      -H "If-Match: $RANGE_EXPECTED_ETAG" "$PACKAGE_URL" || return 1
+  else
+    curl --fail --silent --show-error --location \
+      --retry 3 --retry-delay 2 --connect-timeout 20 \
+      --range "$range_start_requested-$range_end_requested" \
+      --max-filesize "$((range_end_requested - range_start_requested + 1))" \
+      --dump-header "$range_headers_file" --output "$partial_file" \
+      "$PACKAGE_URL" || return 1
+  fi
+  range_http_status=$(read_http_status "$range_headers_file")
+  [ "$range_http_status" = 206 ] || return 1
+  range_content_range=$(read_header_value "$range_headers_file" content-range)
+  read_content_range_parts "$range_content_range" || return 1
+  range_response_etag=$(read_header_value "$range_headers_file" etag)
+  if [ -n "${RANGE_EXPECTED_ETAG-}" ] && [ "$range_response_etag" != "$RANGE_EXPECTED_ETAG" ]; then
+    return 1
+  fi
+  [ "$range_start" -eq "$range_start_requested" ] || return 1
+  [ "$range_end" -le "$range_end_requested" ] || return 1
+  partial_bytes=$(wc -c < "$partial_file")
+  expected_partial_bytes=$((range_end - range_start + 1))
+  [ "$partial_bytes" -eq "$expected_partial_bytes" ] || return 1
+}
+
+fetch_package_range() {
+  fetch_package_range_bounds "$1" "$2" 0 "$3"
+}
+
+parse_control_from_partial() {
+  partial_file=$1
+  partial_bytes=$(wc -c < "$partial_file")
+  [ "$partial_bytes" -ge 8 ] || return 2
+  archive_magic=$(dd if="$partial_file" bs=1 count=7 2>/dev/null || true)
+  [ "$archive_magic" = '!<arch>' ] || return 1
+
+  archive_offset=8
+  while :; do
+    if [ "$archive_offset" -gt "$partial_bytes" ]; then
+      return 2
+    fi
+    if [ $((archive_offset + 60)) -gt "$partial_bytes" ]; then
+      return 2
+    fi
+
+    member_name=$(dd if="$partial_file" bs=1 skip="$archive_offset" count=16 2>/dev/null \
+      | sed 's/[[:space:]]*$//; s|/$||' | tr -d '\r')
+    member_size_text=$(dd if="$partial_file" bs=1 skip=$((archive_offset + 48)) count=10 2>/dev/null \
+      | tr -d '[:space:]')
+    case "$member_size_text" in
+      ''|*[!0-9]*) return 1 ;;
+    esac
+    member_size=$((member_size_text + 0))
+    member_start=$((archive_offset + 60))
+    member_end=$((member_start + member_size))
+    if [ "$member_end" -gt "$partial_bytes" ]; then
+      return 2
+    fi
+
+    case "$member_name" in
+      control.tar.xz|control.tar.gz)
+        control_archive_file=$partial_file.control
+        rm -f "$control_archive_file"
+        dd if="$partial_file" bs=1 skip="$member_start" count="$member_size" \
+          of="$control_archive_file" 2>/dev/null || return 1
+        if [ "$member_name" = control.tar.xz ]; then
+          control_text=$(tar -xOJf "$control_archive_file" ./control 2>/dev/null) || {
+            rm -f "$control_archive_file"
+            return 1
+          }
+        else
+          control_text=$(tar -xzOf "$control_archive_file" ./control 2>/dev/null) || {
+            rm -f "$control_archive_file"
+            return 1
+          }
+        fi
+        rm -f "$control_archive_file"
+        metadata_package_name=$(printf '%s\n' "$control_text" | awk -F': *' '$1 == "Package" {print $2; exit}')
+        metadata_package_architecture=$(printf '%s\n' "$control_text" | awk -F': *' '$1 == "Architecture" {print $2; exit}')
+        metadata_package_version=$(printf '%s\n' "$control_text" | awk -F': *' '$1 == "Version" {print $2; exit}')
+        [ "$metadata_package_name" = chatgpt ] || return 1
+        [ "$metadata_package_architecture" = amd64 ] || return 1
+        [ -n "$metadata_package_version" ] || return 1
+        return 0
+        ;;
+    esac
+
+    archive_offset=$member_end
+    if [ $((archive_offset % 2)) -ne 0 ]; then
+      archive_offset=$((archive_offset + 1))
+    fi
+  done
+}
+
+read_package_metadata_from_remote() {
+  partial_file=$1
+  range_headers_file=$2
+  RANGE_EXPECTED_ETAG=${update_remote_etag-}
+  if ! fetch_package_range "$partial_file" "$range_headers_file" "$METADATA_RANGE_INITIAL_END"; then
+    return 1
+  fi
+  if parse_control_from_partial "$partial_file"; then
+    return 0
+  else
+    parse_metadata_status=$?
+  fi
+  [ "$parse_metadata_status" -eq 2 ] || return 1
+  [ "$METADATA_RANGE_MAX_END" -gt "$METADATA_RANGE_INITIAL_END" ] || return 1
+  if ! fetch_package_range "$partial_file" "$range_headers_file" "$METADATA_RANGE_MAX_END"; then
+    return 1
+  fi
+  parse_control_from_partial "$partial_file"
+}
+
+write_update_check_state() {
+  update_state_directory=$1
+  update_state_file=$2
+  update_state_temporary=$update_state_file.$$
+  mkdir -p "$update_state_directory" || return 1
+  printf '%s\n' \
+    "url=$PACKAGE_URL" \
+    "etag=${update_remote_etag-}" \
+    "last-modified=${update_remote_last_modified-}" \
+    "content-length=${update_remote_content_length-}" \
+    "available-version=${metadata_package_version-}" \
+    "checked-at=${update_check_now-}" > "$update_state_temporary" || return 1
+  chmod 600 "$update_state_temporary"
+  mv -f "$update_state_temporary" "$update_state_file"
+}
+
+read_state_value() {
+  state_file=$1
+  requested_key=$2
+  awk -F= -v requested="$requested_key" '$1 == requested {print substr($0, index($0, "=") + 1); exit}' "$state_file" 2>/dev/null || true
+}
+
+write_update_check_attempt() {
+  update_state_directory=$1
+  update_state_file=$2
+  attempt_etag=
+  attempt_last_modified=
+  attempt_content_length=
+  attempt_available_version=
+  if [ "$stored_url" = "$PACKAGE_URL" ]; then
+    attempt_etag=$stored_etag
+    attempt_last_modified=$(read_state_value "$update_state_file" last-modified)
+    attempt_content_length=$(read_state_value "$update_state_file" content-length)
+    attempt_available_version=$stored_available_version
+  fi
+  update_state_temporary=$update_state_file.$$
+  printf '%s\n' \
+    "url=$PACKAGE_URL" \
+    "etag=$attempt_etag" \
+    "last-modified=$attempt_last_modified" \
+    "content-length=$attempt_content_length" \
+    "available-version=$attempt_available_version" \
+    "checked-at=$update_check_now" > "$update_state_temporary" || return 1
+  chmod 600 "$update_state_temporary"
+  mv -f "$update_state_temporary" "$update_state_file"
+}
+
+download_update_package() {
+  check_architecture
+  require_host_tools || exit 1
+  update_cache_directory=$APP_ROOT/update-cache
+  mkdir -p "$update_cache_directory" \
+    || die "cannot create update cache: $update_cache_directory"
+  package_temporary="$update_cache_directory/$PACKAGE_NAME.$$"
+  package_cached="$update_cache_directory/$PACKAGE_NAME"
+  download_chunk="$package_temporary.chunk"
+  download_headers="$package_temporary.headers"
+  download_head_headers="$package_temporary.head"
+  cleanup_download() {
+    [ -z "${package_temporary-}" ] || rm -f "$package_temporary"
+    rm -f "$download_chunk" "$download_headers" "$download_head_headers"
+  }
+  trap cleanup_download EXIT INT TERM
+  rm -f "$package_cached"
+
+  UPDATE_IF_NONE_MATCH=
+  fetch_package_headers "$download_head_headers" || die 'could not read the latest package headers'
+  [ "$update_http_status" = 200 ] || die "package server returned HTTP $update_http_status"
+  if [ -n "${DOWNLOAD_EXPECTED_ETAG-}" ] \
+    && [ "$update_remote_etag" != "$DOWNLOAD_EXPECTED_ETAG" ]; then
+    die 'the update changed before its download started'
+  fi
+  case "${update_remote_content_length-}" in
+    ''|*[!0-9]*) die 'latest package has no valid content length' ;;
+  esac
+  download_total=$update_remote_content_length
+  [ "$download_total" -gt 0 ] || die 'latest package is empty'
+  RANGE_EXPECTED_ETAG=${update_remote_etag-}
+  : > "$package_temporary"
+  downloaded_bytes=0
+  printf '%s\n' 'status=downloading' 'progress=0'
+  while [ "$downloaded_bytes" -lt "$download_total" ]; do
+    download_range_start=$downloaded_bytes
+    download_range_end=$((download_range_start + FULL_DOWNLOAD_CHUNK_SIZE - 1))
+    [ "$download_range_end" -lt "$download_total" ] || download_range_end=$((download_total - 1))
+    fetch_package_range_bounds "$download_chunk" "$download_headers" \
+      "$download_range_start" "$download_range_end" \
+      || die "could not download package bytes $download_range_start-$download_range_end"
+    [ "$range_total" -eq "$download_total" ] || die 'package size changed during download'
+    download_chunk_etag=$(read_header_value "$download_headers" etag)
+    if [ -n "$update_remote_etag" ] && [ "$download_chunk_etag" != "$update_remote_etag" ]; then
+      die 'package changed during download'
+    fi
+    cat "$download_chunk" >> "$package_temporary" \
+      || die 'could not assemble downloaded package'
+    downloaded_bytes=$((downloaded_bytes + partial_bytes))
+    download_progress=$((downloaded_bytes * 100 / download_total))
+    printf 'progress=%s\n' "$download_progress"
+  done
+  [ "$downloaded_bytes" -eq "$download_total" ] || die 'downloaded package has an unexpected size'
+  PACKAGE_PATH=$package_temporary
+  read_package_metadata "$PACKAGE_PATH"
+  if ! version_is_newer "$package_version" "$INSTALLED_PACKAGE_VERSION"; then
+    rm -f "$package_temporary" "$package_cached"
+    printf '%s\n' 'status=up-to-date' \
+      "installed-version=${INSTALLED_PACKAGE_VERSION:-unknown}" \
+      "available-version=$package_version"
+    exit 0
+  fi
+  mv -f "$package_temporary" "$package_cached" \
+    || die 'could not save the downloaded update'
+  package_temporary=
+  printf '%s\n' 'status=ready' \
+    "installed-version=${INSTALLED_PACKAGE_VERSION:-unknown}" \
+    "available-version=$package_version" \
+    "package-path=$package_cached"
 }
 
 extract_data() {
@@ -725,36 +1034,67 @@ update_app() {
 }
 
 check_update_app() {
+  check_mode=${1-manual}
+  [ "$check_mode" = manual ] || [ "$check_mode" = startup ] \
+    || die 'usage: chatgpt check-update [manual|startup]'
   check_architecture
   require_host_tools || exit 1
-
-  update_cache_directory=$APP_ROOT/update-cache
-  mkdir -p "$update_cache_directory" \
-    || die "cannot create update cache: $update_cache_directory"
-  package_temporary="$update_cache_directory/$PACKAGE_NAME.$$"
-  package_cached="$update_cache_directory/$PACKAGE_NAME"
-  cleanup_update_package() {
-    [ -z "${package_temporary-}" ] || rm -f "$package_temporary"
+  update_state_directory=$APP_ROOT/state
+  mkdir -p "$update_state_directory" \
+    || die "cannot create update state directory: $update_state_directory"
+  update_state_file=$update_state_directory/update-check.meta
+  update_headers_file=$update_state_directory/update-check.headers.$$
+  update_partial_file=$update_state_directory/update-check.partial.$$
+  cleanup_update_check() {
+    rm -f "$update_headers_file" "$update_partial_file" "$update_partial_file.control"
   }
-  trap cleanup_update_package EXIT INT TERM
+  trap cleanup_update_check EXIT INT TERM
 
-  download_latest_package "$package_temporary" quiet \
-    || die 'download failed'
-  read_package_metadata "$package_temporary"
-  if version_is_newer "$package_version" "$INSTALLED_PACKAGE_VERSION"; then
-    mv -f "$package_temporary" "$package_cached" \
-      || die 'could not save the downloaded update'
-    package_temporary=
+  update_check_now=$(date +%s)
+  last_checked=$(read_state_value "$update_state_file" checked-at)
+  stored_url=$(read_state_value "$update_state_file" url)
+  stored_etag=$(read_state_value "$update_state_file" etag)
+  stored_available_version=$(read_state_value "$update_state_file" available-version)
+  case "$last_checked" in
+    ''|*[!0-9]*) last_checked=0 ;;
+  esac
+  if [ "$check_mode" = startup ] && [ "$stored_url" = "$PACKAGE_URL" ] \
+    && [ $((update_check_now - last_checked)) -lt "$AUTOMATIC_UPDATE_INTERVAL" ]; then
+    printf '%s\n' 'status=throttled'
+    return 0
+  fi
+
+  UPDATE_IF_NONE_MATCH=
+  if [ "$stored_url" = "$PACKAGE_URL" ]; then
+    UPDATE_IF_NONE_MATCH=$stored_etag
+  fi
+  write_update_check_attempt "$update_state_directory" "$update_state_file" \
+    || die 'could not save update check state'
+  fetch_package_headers "$update_headers_file" || die 'update metadata request failed'
+  if [ "$update_http_status" = 304 ] \
+    && [ "$stored_url" = "$PACKAGE_URL" ] \
+    && [ -n "$stored_available_version" ]; then
+    metadata_package_version=$stored_available_version
+  else
+    read_package_metadata_from_remote "$update_partial_file" "$update_headers_file" \
+      || die 'could not read package metadata without downloading the full package'
+  fi
+  [ -n "${update_remote_etag-}" ] || update_remote_etag=$stored_etag
+  [ -n "${update_remote_last_modified-}" ] || update_remote_last_modified=$(read_state_value "$update_state_file" last-modified)
+  [ -n "${update_remote_content_length-}" ] || update_remote_content_length=$(read_state_value "$update_state_file" content-length)
+  write_update_check_state "$update_state_directory" "$update_state_file" \
+    || die 'could not save update check state'
+  rm -f "$APP_ROOT/update-cache/$PACKAGE_NAME"
+  if version_is_newer "$metadata_package_version" "$INSTALLED_PACKAGE_VERSION"; then
     printf '%s\n' 'status=update-available'
     printf 'installed-version=%s\n' "${INSTALLED_PACKAGE_VERSION:-unknown}"
-    printf 'available-version=%s\n' "$package_version"
-    printf 'package-path=%s\n' "$package_cached"
+    printf 'available-version=%s\n' "$metadata_package_version"
+    printf 'etag=%s\n' "${update_remote_etag-}"
+    printf 'content-length=%s\n' "${update_remote_content_length-}"
   else
-    rm -f "$package_temporary" "$package_cached"
-    package_temporary=
     printf '%s\n' 'status=up-to-date'
     printf 'installed-version=%s\n' "${INSTALLED_PACKAGE_VERSION:-unknown}"
-    printf 'available-version=%s\n' "$package_version"
+    printf 'available-version=%s\n' "$metadata_package_version"
   fi
 }
 
@@ -804,8 +1144,13 @@ run_chatgpt() {
       update_app
       ;;
     check-update)
-      [ "$#" -eq 1 ] || die 'usage: chatgpt check-update'
-      check_update_app
+      [ "$#" -le 2 ] || die 'usage: chatgpt check-update [manual|startup]'
+      check_update_app "${2-manual}"
+      ;;
+    download-update)
+      [ "$#" -le 2 ] || die 'usage: chatgpt download-update [ETAG]'
+      DOWNLOAD_EXPECTED_ETAG=${2-}
+      download_update_package
       ;;
     install-package)
       [ "$#" -eq 2 ] || die 'usage: chatgpt install-package PACKAGE'

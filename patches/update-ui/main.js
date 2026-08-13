@@ -6,6 +6,7 @@ const path = require('node:path');
 
 const UPDATE_ITEM_ID = 'chatgpt-external-check-for-updates';
 const DECORATION_ITEM_ID = 'chatgpt-external-native-decorations';
+const STARTUP_CHECK_DELAY_MS = 3500;
 
 function diagnostic(message) {
   const target = process.env.CHATGPT_PATCH_DIAGNOSTIC;
@@ -100,13 +101,14 @@ function centerWindowOnParent(window, parentWindow, fallbackWidth, fallbackHeigh
 function updateDialogHtml(context, options) {
   const theme = getUpdateTheme(context);
   const checking = options.checking === true;
+  const downloading = options.downloading === true;
   const updateAvailable = options.updateAvailable === true;
   const message = escapeHtml(options.message);
   const detail = escapeHtml(options.detail).replaceAll('\n', '<br>');
-  const icon = checking
+  const icon = checking || downloading
     ? '<div class="spinner" aria-hidden="true"></div>'
     : `<div class="status-mark ${options.type === 'error' ? 'error' : ''}" aria-hidden="true">${options.type === 'error' ? '!' : 'i'}</div>`;
-  const buttons = checking
+  const buttons = checking || downloading
     ? ''
     : updateAvailable
       ? '<button class="button primary" data-action="update">Update Now</button><button class="button secondary" data-action="later">Later</button>'
@@ -132,6 +134,8 @@ function updateDialogHtml(context, options) {
   .status-mark { align-items: center; background: var(--accent); border-radius: 50%; color: var(--accent-text); display: flex; font-size: 15px; font-weight: 700; height: 28px; justify-content: center; margin-bottom: 13px; width: 28px; }
   .status-mark.error { background: #d93025; color: #ffffff; }
   .spinner { animation: spin 1s linear infinite; border: 3px solid var(--border); border-radius: 50%; border-top-color: var(--accent); height: 26px; margin: 0 auto 15px; width: 26px; }
+  .progress { background: var(--border); border-radius: 999px; height: 10px; margin: 18px auto 0; max-width: 390px; overflow: hidden; width: 100%; }
+  .progress-value { background: var(--accent); height: 100%; transition: width .15s ease; width: ${Math.max(0, Math.min(100, Number(options.progress) || 0))}%; }
   h1 { font-size: 17px; line-height: 1.3; margin: 0 0 10px; }
   p { color: var(--muted); line-height: 1.45; margin: 0; max-width: 410px; }
   .actions { background: var(--surface-raised); border-top: 1px solid var(--border); display: flex; gap: 10px; justify-content: flex-end; padding: 12px 14px; }
@@ -143,7 +147,7 @@ function updateDialogHtml(context, options) {
   @keyframes spin { to { transform: rotate(360deg); } }
 </style></head><body>
   <div class="window">
-    <main class="content">${icon}<h1>${message}</h1><p>${detail}</p></main>
+    <main class="content">${icon}<h1>${message}</h1><p>${detail}</p>${downloading ? '<div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100"><div class="progress-value"></div></div>' : ''}</main>
     ${buttons ? `<footer class="actions">${buttons}</footer>` : ''}
   </div>
   <script>
@@ -160,8 +164,9 @@ function createUpdateWindow(context, parentWindow, options) {
   const BrowserWindow = context.electron.BrowserWindow;
   if (typeof BrowserWindow !== 'function') return null;
   const checking = options.checking === true;
+  const downloading = options.downloading === true;
   const width = checking ? 380 : 500;
-  const height = checking ? 170 : 285;
+  const height = checking ? 170 : downloading ? 250 : 285;
   const theme = getUpdateTheme(context);
   let updateWindow = null;
   let settled = false;
@@ -186,7 +191,7 @@ function createUpdateWindow(context, parentWindow, options) {
       resizable: false,
       minimizable: false,
       maximizable: false,
-      closable: !checking,
+      closable: !checking && !downloading,
       frame: true,
       useContentSize: true,
       show: false,
@@ -253,19 +258,61 @@ function openCheckingWindow(context, parentWindow) {
   return customWindow?.window || null;
 }
 
+function openDownloadWindow(context, parentWindow, version) {
+  const customWindow = createUpdateWindow(context, parentWindow, {
+    downloading: true,
+    progress: 0,
+    message: `Downloading ChatGPT ${version}...`,
+    detail: 'The update will be installed after the download reaches 100%.',
+    type: 'info',
+  });
+  if (!customWindow) return null;
+  customWindow.progress = 0;
+  customWindow.window?.webContents.once?.('did-finish-load', () => {
+    applyDownloadProgress(customWindow, customWindow.progress);
+  });
+  return customWindow;
+}
+
+function updateDownloadWindow(downloadWindow, progress) {
+  const safeProgress = Math.max(0, Math.min(100, Number(progress) || 0));
+  if (!downloadWindow) return;
+  downloadWindow.progress = safeProgress;
+  if (!downloadWindow.window || downloadWindow.window.isDestroyed?.()) return;
+  if (!downloadWindow.window.webContents.isLoading?.()) {
+    applyDownloadProgress(downloadWindow, safeProgress);
+  }
+}
+
+function applyDownloadProgress(downloadWindow, safeProgress) {
+  if (!downloadWindow?.window || downloadWindow.window.isDestroyed?.()) return;
+  const scriptResult = downloadWindow.window.webContents.executeJavaScript?.(
+    `document.querySelector('.progress-value')?.style.setProperty('width', '${safeProgress}%');` +
+    `document.querySelector('.progress')?.setAttribute('aria-valuenow', '${safeProgress}');` +
+    `document.querySelector('p').textContent = ${JSON.stringify(`${safeProgress}% downloaded`)};`,
+    true,
+  );
+  scriptResult?.catch?.(() => {});
+}
+
+function closeDownloadWindow(downloadWindow) {
+  if (!downloadWindow?.window || downloadWindow.window.isDestroyed?.()) return;
+  downloadWindow.window.destroy?.();
+}
+
 function closeCheckingWindow(checkingWindow) {
   if (!checkingWindow || checkingWindow.isDestroyed()) return;
   checkingWindow.destroy();
 }
 
-function checkForUpdates(context) {
-  if (context.externalActionStarted || context.updateCheckStarted) return;
+function checkForUpdates(context, mode = 'manual') {
+  if (context.externalActionStarted || context.updateCheckStarted || context.updatePromptStarted || context.updateDownloadStarted) return;
   context.updateCheckStarted = true;
 
   const cliPath = path.join(context.appRoot, 'installer');
   const parentWindow = getParentWindow(context);
-  const checkingWindow = openCheckingWindow(context, parentWindow);
-  const child = spawn(cliPath, ['check-update'], {
+  const checkingWindow = mode === 'manual' ? openCheckingWindow(context, parentWindow) : null;
+  const child = spawn(cliPath, ['check-update', mode], {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: process.env,
   });
@@ -281,6 +328,7 @@ function checkForUpdates(context) {
 
     if (error || exitCode !== 0) {
       const detail = error?.message || errorOutput.trim() || `The update check exited with code ${exitCode}.`;
+      if (mode === 'startup') return;
       showUpdateDialog(context, parentWindow, {
         type: 'error',
         title: 'ChatGPT Updates',
@@ -293,6 +341,7 @@ function checkForUpdates(context) {
 
     const result = parseCheckResult(output);
     if (result.status === 'up-to-date') {
+      if (mode === 'startup') return;
       showUpdateDialog(context, parentWindow, {
         type: 'info',
         title: 'ChatGPT Updates',
@@ -303,7 +352,8 @@ function checkForUpdates(context) {
       return;
     }
 
-    if (result.status !== 'update-available' || !result['package-path']) {
+    if (result.status !== 'update-available') {
+      if (result.status === 'throttled' || mode === 'startup') return;
       showUpdateDialog(context, parentWindow, {
         type: 'error',
         title: 'ChatGPT Updates',
@@ -314,19 +364,23 @@ function checkForUpdates(context) {
       return;
     }
 
+    context.updatePromptStarted = true;
     showUpdateDialog(context, parentWindow, {
       type: 'info',
       title: 'ChatGPT Updates',
       message: `ChatGPT ${result['available-version']} is available.`,
-      detail: `Installed version: ${result['installed-version'] || 'unknown'}\nThe update has been downloaded and is ready to install.`,
+      detail: `Installed version: ${result['installed-version'] || 'unknown'}\nThe update will be downloaded after you choose Update Now.`,
       buttons: ['Update Now', 'Later'],
       cancelId: 1,
       defaultId: 0,
     }).then(({ response }) => {
+      context.updatePromptStarted = false;
       if (response === 0) {
-        spawnAfterQuit(context, 'update-from-menu.sh', [result['package-path']]);
+        downloadAndInstallUpdate(context, parentWindow, result['available-version'], result.etag);
       }
-    }).catch(() => {});
+    }).catch(() => {
+      context.updatePromptStarted = false;
+    });
   };
 
   child.stdout.on('data', (chunk) => {
@@ -337,6 +391,107 @@ function checkForUpdates(context) {
   });
   child.once('error', (error) => finish(error, 1));
   child.once('close', (exitCode) => finish(null, exitCode));
+}
+
+function downloadAndInstallUpdate(context, parentWindow, version, etag) {
+  if (context.externalActionStarted || context.updateDownloadStarted) return;
+  context.updateDownloadStarted = true;
+  const downloadWindow = openDownloadWindow(context, parentWindow, version || 'latest');
+  if (!downloadWindow) {
+    context.updateDownloadStarted = false;
+    showUpdateDialog(context, parentWindow, {
+      type: 'error',
+      title: 'ChatGPT Updates',
+      message: 'Could not open the download window.',
+      detail: 'The update was not started.',
+      buttons: ['OK'],
+    }).catch(() => {});
+    return;
+  }
+  const cliPath = path.join(context.appRoot, 'installer');
+  const childArguments = ['download-update'];
+  if (etag) childArguments.push(etag);
+  const child = spawn(cliPath, childArguments, {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: process.env,
+  });
+  let output = '';
+  let errorOutput = '';
+  let completed = false;
+  const finish = (error, exitCode) => {
+    if (completed) return;
+    completed = true;
+    context.updateDownloadStarted = false;
+    if (error || exitCode !== 0) {
+      closeDownloadWindow(downloadWindow);
+      const detail = error?.message || errorOutput.trim() || `The update download exited with code ${exitCode}.`;
+      showUpdateDialog(context, parentWindow, {
+        type: 'error',
+        title: 'ChatGPT Updates',
+        message: 'Could not download the update.',
+        detail,
+        buttons: ['OK'],
+      }).catch(() => {});
+      return;
+    }
+    const result = parseCheckResult(output);
+    if (result.status === 'up-to-date') {
+      closeDownloadWindow(downloadWindow);
+      showUpdateDialog(context, parentWindow, {
+        type: 'info',
+        title: 'ChatGPT Updates',
+        message: 'ChatGPT is already up to date.',
+        detail: `Installed version: ${result['installed-version'] || 'unknown'}\nLatest version: ${result['available-version'] || 'unknown'}`,
+        buttons: ['OK'],
+      }).catch(() => {});
+      return;
+    }
+    if (result.status !== 'ready' || !result['package-path']) {
+      closeDownloadWindow(downloadWindow);
+      showUpdateDialog(context, parentWindow, {
+        type: 'error',
+        title: 'ChatGPT Updates',
+        message: 'The update download returned an invalid result.',
+        detail: output.trim() || 'No downloaded package was returned.',
+        buttons: ['OK'],
+      }).catch(() => {});
+      return;
+    }
+    updateDownloadWindow(downloadWindow, 100);
+    setTimeout(() => {
+      closeDownloadWindow(downloadWindow);
+      spawnAfterQuit(context, 'update-from-menu.sh', [result['package-path']]);
+    }, 450);
+  };
+  let outputLineBuffer = '';
+  child.stdout.on('data', (chunk) => {
+    const text = chunk.toString();
+    output += text;
+    outputLineBuffer += text;
+    const lines = outputLineBuffer.split(/\r?\n/);
+    outputLineBuffer = lines.pop() || '';
+    for (const line of lines) {
+      if (line.startsWith('progress=')) updateDownloadWindow(downloadWindow, line.slice(9));
+    }
+  });
+  child.stderr.on('data', (chunk) => {
+    errorOutput += chunk.toString();
+  });
+  child.once('error', (error) => finish(error, 1));
+  child.once('close', (exitCode) => finish(null, exitCode));
+}
+
+function scheduleStartupCheck(context) {
+  if (context.startupCheckScheduled || context.externalActionStarted) return;
+  context.startupCheckScheduled = true;
+  const schedule = () => {
+    setTimeout(() => {
+      context.startupCheckScheduled = false;
+      checkForUpdates(context, 'startup');
+    }, STARTUP_CHECK_DELAY_MS).unref?.();
+  };
+  if (context.electron.app.isReady?.()) schedule();
+  else context.electron.app.once?.('ready', schedule);
 }
 
 function spawnAfterQuit(context, helperName, extraArguments = []) {
@@ -372,7 +527,7 @@ function addPatchItems(menu, context, MenuItem) {
     help.append(new MenuItem({
       id: UPDATE_ITEM_ID,
       label: 'Check for Updates...',
-      click: () => checkForUpdates(context),
+      click: () => checkForUpdates(context, 'manual'),
     }));
     diagnostic('update-ui: added Check for Updates to Help');
   }
@@ -417,5 +572,6 @@ module.exports = {
     };
     setApplicationMenu.__chatgptExternalUpdatePatch = true;
     Menu.setApplicationMenu = setApplicationMenu;
+    scheduleStartupCheck(context);
   },
 };
