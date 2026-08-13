@@ -784,10 +784,12 @@ copy_support_files() {
   backup_support="$temporary_root/original-support"
   if [ -e "$APP_ROOT/bin" ] || [ -e "$APP_ROOT/lib" ] || [ -e "$APP_ROOT/runtime" ] || [ -e "$APP_ROOT/patches" ]; then
     mkdir -p "$backup_support"
+    support_replaced=1
     for support_directory in bin lib runtime patches; do
       if [ -e "$APP_ROOT/$support_directory" ]; then
         mv "$APP_ROOT/$support_directory" "$backup_support/$support_directory" \
           || die "could not back up existing $support_directory files"
+        support_backup_list="$support_backup_list $support_directory"
       fi
     done
   fi
@@ -795,6 +797,7 @@ copy_support_files() {
   for support_directory in bin lib runtime patches; do
     mv "$support_temporary/$support_directory" "$APP_ROOT/$support_directory" \
       || die "could not install $support_directory files"
+    support_installed_list="$support_installed_list $support_directory"
   done
   rmdir "$support_temporary" 2>/dev/null || true
 }
@@ -804,13 +807,18 @@ write_command_link() {
   mkdir -p "$command_directory"
   if [ -e "$COMMAND_PATH" ] || [ -L "$COMMAND_PATH" ]; then
     command_target=$(readlink -f "$COMMAND_PATH" 2>/dev/null || true)
-    if [ -L "$COMMAND_PATH" ] && [ "$command_target" = "$APP_ROOT/bin/chatgpt" ]; then
-      rm -f "$COMMAND_PATH"
-    else
+    if [ ! -L "$COMMAND_PATH" ] || [ "$command_target" != "$APP_ROOT/bin/chatgpt" ]; then
       die "refusing to replace an existing command: $COMMAND_PATH"
     fi
   fi
-  ln -s "$APP_ROOT/bin/chatgpt" "$COMMAND_PATH"
+  command_temporary="$COMMAND_PATH.$$"
+  if ! ln -s "$APP_ROOT/bin/chatgpt" "$command_temporary"; then
+    die "could not prepare the ChatGPT command link: $COMMAND_PATH"
+  fi
+  if ! mv -f "$command_temporary" "$COMMAND_PATH"; then
+    rm -f "$command_temporary"
+    die "could not install the ChatGPT command link: $COMMAND_PATH"
+  fi
 }
 
 write_native_decoration_patch() {
@@ -852,6 +860,7 @@ write_config() {
 write_desktop_entry() {
   desktop_directory=$(dirname -- "$DESKTOP_FILE")
   mkdir -p "$desktop_directory"
+  desktop_temporary="$desktop_directory/.chatgpt.$$.desktop"
   printf '%s\n' \
     '[Desktop Entry]' \
     'Name=ChatGPT' \
@@ -863,11 +872,20 @@ write_desktop_entry() {
     'Terminal=false' \
     'StartupNotify=true' \
     'Categories=Utility;' \
-    'MimeType=x-scheme-handler/codex;text/csv;application/vnd.openxmlformats-officedocument.wordprocessingml.document;application/vnd.openxmlformats-officedocument.presentationml.presentation;text/tab-separated-values;application/vnd.ms-excel;application/vnd.ms-excel.sheet.macroEnabled.12;application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;' > "$DESKTOP_FILE"
-  chmod 644 "$DESKTOP_FILE"
+    'MimeType=x-scheme-handler/codex;text/csv;application/vnd.openxmlformats-officedocument.wordprocessingml.document;application/vnd.openxmlformats-officedocument.presentationml.presentation;text/tab-separated-values;application/vnd.ms-excel;application/vnd.ms-excel.sheet.macroEnabled.12;application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;' > "$desktop_temporary" \
+    || { rm -f "$desktop_temporary"; die "could not prepare the desktop entry: $DESKTOP_FILE"; }
+  chmod 644 "$desktop_temporary" \
+    || { rm -f "$desktop_temporary"; die "could not set desktop entry permissions: $DESKTOP_FILE"; }
 
   if command -v desktop-file-validate >/dev/null 2>&1; then
-    desktop-file-validate "$DESKTOP_FILE" || die "generated desktop entry is invalid: $DESKTOP_FILE"
+    if ! desktop-file-validate "$desktop_temporary"; then
+      rm -f "$desktop_temporary"
+      die "generated desktop entry is invalid: $DESKTOP_FILE"
+    fi
+  fi
+  if ! mv -f "$desktop_temporary" "$DESKTOP_FILE"; then
+    rm -f "$desktop_temporary"
+    die "could not install the desktop entry: $DESKTOP_FILE"
   fi
   if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "$desktop_directory" >/dev/null 2>&1 || true
@@ -898,19 +916,38 @@ install_payload() {
     || die "cannot create a temporary directory inside $APP_ROOT"
   EXTRACTED_PATH="$temporary_root/extracted"
   backup_usr="$temporary_root/original-usr"
+  backup_etc="$temporary_root/original-etc"
+  backup_var="$temporary_root/original-var"
   backup_support="$temporary_root/original-support"
   payload_replaced=0
   support_replaced=0
+  etc_backup_created=0
+  var_backup_created=0
+  etc_payload_created=0
+  var_payload_created=0
+  support_backup_list=
+  support_installed_list=
+  user_data_existed=0
+  state_existed=0
   payload_install_succeeded=0
+
+  if [ -e "$APP_ROOT/user-data" ] || [ -L "$APP_ROOT/user-data" ]; then
+    user_data_existed=1
+  fi
+  if [ -e "$APP_ROOT/state" ] || [ -L "$APP_ROOT/state" ]; then
+    state_existed=1
+  fi
 
   rollback_payload() {
     if [ "$support_replaced" -eq 1 ]; then
       failed_support="$temporary_root/failed-support"
-      mkdir -p "$failed_support"
-      for support_directory in bin lib runtime patches; do
+      [ -z "$support_installed_list" ] || mkdir -p "$failed_support"
+      for support_directory in $support_installed_list; do
         if [ -e "$APP_ROOT/$support_directory" ]; then
           mv "$APP_ROOT/$support_directory" "$failed_support/$support_directory" || true
         fi
+      done
+      for support_directory in $support_backup_list; do
         if [ -e "$backup_support/$support_directory" ]; then
           mv "$backup_support/$support_directory" "$APP_ROOT/$support_directory" || true
         fi
@@ -918,6 +955,20 @@ install_payload() {
       support_replaced=0
     fi
     if [ "$payload_replaced" -eq 1 ]; then
+      failed_etc="$temporary_root/failed-etc"
+      if [ "$etc_payload_created" -eq 1 ] && [ -e "$APP_ROOT/etc" ]; then
+        mv "$APP_ROOT/etc" "$failed_etc" || true
+      fi
+      if [ "$etc_backup_created" -eq 1 ] && [ -e "$backup_etc" ]; then
+        mv "$backup_etc" "$APP_ROOT/etc" || true
+      fi
+      failed_var="$temporary_root/failed-var"
+      if [ "$var_payload_created" -eq 1 ] && [ -e "$APP_ROOT/var" ]; then
+        mv "$APP_ROOT/var" "$failed_var" || true
+      fi
+      if [ "$var_backup_created" -eq 1 ] && [ -e "$backup_var" ]; then
+        mv "$backup_var" "$APP_ROOT/var" || true
+      fi
       failed_usr="$temporary_root/failed-usr"
       if [ -e "$APP_ROOT/usr" ]; then
         mv "$APP_ROOT/usr" "$failed_usr" || true
@@ -926,6 +977,12 @@ install_payload() {
         mv "$backup_usr" "$APP_ROOT/usr" || true
       fi
       payload_replaced=0
+    fi
+    if [ "$state_existed" -eq 0 ]; then
+      rm -rf "$APP_ROOT/state"
+    fi
+    if [ "$user_data_existed" -eq 0 ]; then
+      rm -rf "$APP_ROOT/user-data"
     fi
   }
 
@@ -964,14 +1021,29 @@ install_payload() {
     mv "$APP_ROOT/usr" "$backup_usr" \
       || die 'could not prepare the current installation for replacement'
   fi
-  if ! mv "$EXTRACTED_PATH/usr" "$APP_ROOT/usr"; then
-    [ ! -e "$backup_usr" ] || mv "$backup_usr" "$APP_ROOT/usr" || true
-    die 'could not install the downloaded application files'
-  fi
   payload_replaced=1
-  rm -rf "$APP_ROOT/etc" "$APP_ROOT/var"
-  [ ! -e "$EXTRACTED_PATH/etc" ] || cp -a "$EXTRACTED_PATH/etc" "$APP_ROOT/etc"
-  [ ! -e "$EXTRACTED_PATH/var" ] || cp -a "$EXTRACTED_PATH/var" "$APP_ROOT/var"
+  mv "$EXTRACTED_PATH/usr" "$APP_ROOT/usr" \
+    || die 'could not install the downloaded application files'
+  if [ -e "$APP_ROOT/etc" ]; then
+    mv "$APP_ROOT/etc" "$backup_etc" \
+      || die 'could not prepare the current etc files for replacement'
+    etc_backup_created=1
+  fi
+  if [ -e "$APP_ROOT/var" ]; then
+    mv "$APP_ROOT/var" "$backup_var" \
+      || die 'could not prepare the current var files for replacement'
+    var_backup_created=1
+  fi
+  if [ -e "$EXTRACTED_PATH/etc" ]; then
+    etc_payload_created=1
+    cp -a "$EXTRACTED_PATH/etc" "$APP_ROOT/etc" \
+      || die 'could not install the downloaded etc files'
+  fi
+  if [ -e "$EXTRACTED_PATH/var" ]; then
+    var_payload_created=1
+    cp -a "$EXTRACTED_PATH/var" "$APP_ROOT/var" \
+      || die 'could not install the downloaded var files'
+  fi
   mkdir -p "$APP_ROOT/user-data"
   copy_support_files
   write_native_decoration_patch || die 'could not install the native decoration patch helper'

@@ -212,6 +212,7 @@ def main() -> int:
         return 1
 
     try:
+        LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
         with LOCK_FILE.open("a+") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             data = ARCHIVE.read_bytes()

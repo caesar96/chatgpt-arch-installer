@@ -183,7 +183,11 @@ https://persistent.oaistatic.com/codex-app-prod/linux/deb/latest/chatgpt_amd64.d
 
 The installer validates the package name, architecture, Debian metadata,
 required payload files, and dynamic dependencies before replacing an existing
-payload. Debian maintainer scripts are never executed.
+payload. Payload replacement is transactional: if extraction, support-file
+installation, or the native-decoration patch fails, the previous payload is
+restored and temporary package files are removed. Preserved user data is not
+part of the replacement transaction. Debian maintainer scripts are never
+executed.
 
 The native-decoration patch uses exact byte matches, version/hash-specific
 backups, a lock, and atomic writes. If the packaged code no longer matches the
