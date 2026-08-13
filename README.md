@@ -105,7 +105,8 @@ chatgpt --no-patches
 The two bundled patches are:
 
 - `update-menu`: adds the update and native-decoration actions to the Help
-  menu and performs throttled startup update checks.
+  menu and performs lightweight startup update checks, throttled to once per
+  hour.
 - `native-window-decorations`: records the native-decoration capability. The
   stable implementation remains the verified exact-match ASAR patch.
 
@@ -125,7 +126,12 @@ ChatGPT remains open. Once the download is complete, ChatGPT closes, the
 payload is replaced, the selected patches are reapplied, and the app relaunches.
 
 The update state and temporary package are stored inside the selected
-installation directory under `state/` and `update-cache/`.
+installation directory under `state/` and `update-cache/`. Automatic checks
+are limited to once per hour because they run during application startup, but
+they only request package metadata rather than downloading the full package.
+If a previous successful check already found a newer version, that cached
+result is shown on startup even while the network check is throttled. Failed
+network checks do not advance the successful-check timestamp.
 
 ## Installed layout
 

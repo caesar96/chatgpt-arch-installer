@@ -3,7 +3,7 @@ set -eu
 
 PACKAGE_URL=${CHATGPT_PACKAGE_URL:-https://persistent.oaistatic.com/codex-app-prod/linux/deb/latest/chatgpt_amd64.deb}
 PACKAGE_NAME=chatgpt_amd64.deb
-AUTOMATIC_UPDATE_INTERVAL=86400
+AUTOMATIC_UPDATE_INTERVAL=3600
 METADATA_RANGE_INITIAL_END=65535
 METADATA_RANGE_MAX_END=4194303
 FULL_DOWNLOAD_CHUNK_SIZE=16777216
@@ -583,31 +583,6 @@ read_state_value() {
   state_file=$1
   requested_key=$2
   awk -F= -v requested="$requested_key" '$1 == requested {print substr($0, index($0, "=") + 1); exit}' "$state_file" 2>/dev/null || true
-}
-
-write_update_check_attempt() {
-  update_state_directory=$1
-  update_state_file=$2
-  attempt_etag=
-  attempt_last_modified=
-  attempt_content_length=
-  attempt_available_version=
-  if [ "$stored_url" = "$PACKAGE_URL" ]; then
-    attempt_etag=$stored_etag
-    attempt_last_modified=$(read_state_value "$update_state_file" last-modified)
-    attempt_content_length=$(read_state_value "$update_state_file" content-length)
-    attempt_available_version=$stored_available_version
-  fi
-  update_state_temporary=$update_state_file.$$
-  printf '%s\n' \
-    "url=$PACKAGE_URL" \
-    "etag=$attempt_etag" \
-    "last-modified=$attempt_last_modified" \
-    "content-length=$attempt_content_length" \
-    "available-version=$attempt_available_version" \
-    "checked-at=$update_check_now" > "$update_state_temporary" || return 1
-  chmod 600 "$update_state_temporary"
-  mv -f "$update_state_temporary" "$update_state_file"
 }
 
 download_update_package() {
@@ -1303,11 +1278,20 @@ check_update_app() {
   stored_url=$(read_state_value "$update_state_file" url)
   stored_etag=$(read_state_value "$update_state_file" etag)
   stored_available_version=$(read_state_value "$update_state_file" available-version)
+  stored_content_length=$(read_state_value "$update_state_file" content-length)
   case "$last_checked" in
     ''|*[!0-9]*) last_checked=0 ;;
   esac
   if [ "$check_mode" = startup ] && [ "$stored_url" = "$PACKAGE_URL" ] \
     && [ $((update_check_now - last_checked)) -lt "$AUTOMATIC_UPDATE_INTERVAL" ]; then
+    if version_is_newer "$stored_available_version" "$INSTALLED_PACKAGE_VERSION"; then
+      printf '%s\n' 'status=update-available'
+      printf 'installed-version=%s\n' "${INSTALLED_PACKAGE_VERSION:-unknown}"
+      printf 'available-version=%s\n' "$stored_available_version"
+      printf 'etag=%s\n' "$stored_etag"
+      printf 'content-length=%s\n' "$stored_content_length"
+      return 0
+    fi
     printf '%s\n' 'status=throttled'
     return 0
   fi
@@ -1316,8 +1300,6 @@ check_update_app() {
   if [ "$stored_url" = "$PACKAGE_URL" ]; then
     UPDATE_IF_NONE_MATCH=$stored_etag
   fi
-  write_update_check_attempt "$update_state_directory" "$update_state_file" \
-    || die 'could not save update check state'
   fetch_package_headers "$update_headers_file" || die 'update metadata request failed'
   if [ "$update_http_status" = 304 ] \
     && [ "$stored_url" = "$PACKAGE_URL" ] \
