@@ -61,6 +61,8 @@ Native window decorations can be selected non-interactively:
 
 `install-chatgpt.sh` is only the initial installation entrypoint. After
 installation, all normal operations belong to the `chatgpt` command.
+Interactive installer output highlights important paths and commands; set
+`NO_COLOR=1` to disable ANSI colors.
 
 ## Usage
 
@@ -132,7 +134,6 @@ The installed tree deliberately uses semantic names:
 ```text
 <chosen-directory>/
   usr/                                  Downloaded application payload
-  user-data/                            Electron profile and session data
   bin/chatgpt                            Public CLI and lifecycle command
   bin/chatgpt-launcher                   Electron process launcher
   lib/chatgpt-core.sh                    Shared shell implementation
@@ -147,6 +148,7 @@ The installed tree deliberately uses semantic names:
 
 ~/.local/bin/chatgpt                      Symlink to bin/chatgpt
 ~/.config/chatgpt/settings.conf           Installation settings
+~/.config/chatgpt/user-data/              Electron profile and session data
 ~/.local/share/applications/chatgpt.desktop
 ```
 
@@ -163,12 +165,26 @@ config_directory="${XDG_CONFIG_HOME:-$HOME/.config}/chatgpt"
 mv "$config_directory/install.conf" "$config_directory/settings.conf"
 ```
 
-The new installer will rewrite `settings.conf` with the current patch names
-and package version after installation.
+If that older installation stored the profile inside its application
+directory, move it to the new user-data location before reinstalling:
 
-The default uninstall preserves `<chosen-directory>/user-data`, `~/.codex`,
+```bash
+old_installation="$HOME/Apps/ChatGPT"
+mkdir -p "$config_directory"
+mv "$old_installation/user-data" "$config_directory/user-data"
+```
+
+The new installer will rewrite `settings.conf` with the current patch names
+and package version after installation. If `settings.conf` already exists,
+only the profile move is needed.
+
+The default uninstall preserves `~/.config/chatgpt/user-data`, `~/.codex`,
 and the ChatGPT configuration directory. The explicit
 `--no-preserve-data` option removes those data paths as well.
+
+Because the profile is stored outside the application root, choosing a
+different installation directory on a later install does not require moving
+the ChatGPT session or user data.
 
 The desktop entry is named `chatgpt.desktop`, matching the official `.deb`.
 The application icon is read from the extracted package payload.

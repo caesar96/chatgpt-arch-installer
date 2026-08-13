@@ -9,6 +9,7 @@ METADATA_RANGE_MAX_END=4194303
 FULL_DOWNLOAD_CHUNK_SIZE=16777216
 CONFIG_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/chatgpt/settings.conf
 CONFIG_DIRECTORY=${XDG_CONFIG_HOME:-$HOME/.config}/chatgpt
+USER_DATA_DIRECTORY=$CONFIG_DIRECTORY/user-data
 DESKTOP_FILE=${XDG_DATA_HOME:-$HOME/.local/share}/applications/chatgpt.desktop
 MIME_APPS_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/mimeapps.list
 COMMAND_PATH=$HOME/.local/bin/chatgpt
@@ -21,6 +22,21 @@ INSTALLED_PACKAGE_VERSION=
 CONFIG_READ_FILE=
 CHATGPT_SOURCE_ROOT=${CHATGPT_SOURCE_ROOT-}
 CHATGPT_ENTRYPOINT=${CHATGPT_ENTRYPOINT-}
+COLOR_RESET=
+COLOR_BOLD=
+COLOR_GREEN=
+COLOR_CYAN=
+COLOR_YELLOW=
+COLOR_RED=
+
+if [ -t 1 ] && [ -z "${NO_COLOR-}" ] && [ "${TERM-}" != dumb ]; then
+  COLOR_RESET=$(printf '\033[0m')
+  COLOR_BOLD=$(printf '\033[1m')
+  COLOR_GREEN=$(printf '\033[32m')
+  COLOR_CYAN=$(printf '\033[36m')
+  COLOR_YELLOW=$(printf '\033[33m')
+  COLOR_RED=$(printf '\033[31m')
+fi
 
 die() {
   printf 'chatgpt: %s\n' "$*" >&2
@@ -91,7 +107,7 @@ require_host_tools() {
     fi
   done
   if [ -n "$missing_tools" ]; then
-    printf 'chatgpt: missing host tools:%s\n' "$missing_tools" >&2
+    printf '%schatgpt: missing host tools:%s%s\n' "$COLOR_RED" "$missing_tools" "$COLOR_RESET" >&2
     printf '%s\n' 'Install the corresponding CachyOS/Arch packages, then rerun this script.' >&2
     return 1
   fi
@@ -277,19 +293,6 @@ directory_has_content() {
   return 1
 }
 
-directory_has_only_user_data() {
-  [ -r "$CONFIG_FILE" ] || return 1
-  configured_root=$(awk 'NR == 1 {print; exit}' "$CONFIG_FILE")
-  [ "$configured_root" = "$APP_ROOT" ] || return 1
-  [ -d "$APP_ROOT/user-data" ] || [ -L "$APP_ROOT/user-data" ] || return 1
-  [ ! -L "$APP_ROOT/user-data" ] || return 1
-  for candidate in "$APP_ROOT"/* "$APP_ROOT"/.[!.]* "$APP_ROOT"/..?*; do
-    [ -e "$candidate" ] || [ -L "$candidate" ] || continue
-    [ "$candidate" = "$APP_ROOT/user-data" ] || return 1
-  done
-  return 0
-}
-
 is_running_at() {
   executable=$1/usr/lib/chatgpt/ChatGPT
   for process_dir in /proc/[0-9]*; do
@@ -311,8 +314,11 @@ prepare_install_root() {
     if is_running_at "$APP_ROOT"; then
       die 'close ChatGPT before installing or updating it'
     fi
+    if [ -e "$APP_ROOT/user-data" ] || [ -L "$APP_ROOT/user-data" ]; then
+      die "this installation stores user data inside $APP_ROOT; run chatgpt uninstall, then move $APP_ROOT/user-data to $USER_DATA_DIRECTORY before reinstalling"
+    fi
   else
-    if directory_has_content && ! directory_has_only_user_data; then
+    if directory_has_content; then
       die "installation directory is not empty: $APP_ROOT"
     fi
   fi
@@ -706,6 +712,8 @@ write_run_launcher() {
     'export CHATGPT_APP_ROOT="$APP_ROOT"' \
     'if [ -r "$APP_ROOT/usr/lib/chatgpt/version" ]; then export CHATGPT_APP_VERSION=$(awk "NR==1 {print; exit}" "$APP_ROOT/usr/lib/chatgpt/version"); fi' \
     'CONFIG_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/chatgpt/settings.conf' \
+    'USER_DATA_DIRECTORY=${XDG_CONFIG_HOME:-$HOME/.config}/chatgpt/user-data' \
+    'mkdir -p "$USER_DATA_DIRECTORY"' \
     'if [ -r "$CONFIG_FILE" ]; then export CHATGPT_PATCHES=$(awk -F= '\''$1 == "patches" {print $2; exit}'\'' "$CONFIG_FILE"); fi' \
     'if [ -r "$CONFIG_FILE" ]; then export CHATGPT_NATIVE_DECORATIONS=$(awk -F= '\''$1 == "native_decorations" {print $2; exit}'\'' "$CONFIG_FILE"); fi' \
     'if [ "${CHATGPT_NO_PATCHES-0}" != 1 ] && [ -n "${CHATGPT_PATCHES-}" ]; then' \
@@ -713,7 +721,7 @@ write_run_launcher() {
     '  export NODE_OPTIONS="${NODE_OPTIONS-} --require=$APP_ROOT/runtime/patch-loader.js"' \
     'fi' \
     'exec "$APP_ROOT/usr/lib/chatgpt/ChatGPT" \' \
-    '  --user-data-dir="$APP_ROOT/user-data" \' \
+    '  --user-data-dir="$USER_DATA_DIRECTORY" \' \
     '  "$@"' > "$launcher_path"
   chmod u+x "$launcher_path"
 }
@@ -902,9 +910,9 @@ report_command_path() {
       ;;
     *)
       printf '%s\n' \
-        "The command was installed at $COMMAND_PATH, but $HOME/.local/bin is not in the current PATH." \
+        "The command was installed at ${COLOR_CYAN}$COMMAND_PATH${COLOR_RESET}, but $HOME/.local/bin is not in the current PATH." \
         'For this terminal session, run:' \
-        '  export PATH="$HOME/.local/bin:$PATH"' \
+        "  ${COLOR_YELLOW}export PATH=\"\$HOME/.local/bin:\$PATH\"${COLOR_RESET}" \
         'Add that export to ~/.bashrc or ~/.zshrc to make it persistent.'
       ;;
   esac
@@ -927,13 +935,9 @@ install_payload() {
   var_payload_created=0
   support_backup_list=
   support_installed_list=
-  user_data_existed=0
   state_existed=0
   payload_install_succeeded=0
 
-  if [ -e "$APP_ROOT/user-data" ] || [ -L "$APP_ROOT/user-data" ]; then
-    user_data_existed=1
-  fi
   if [ -e "$APP_ROOT/state" ] || [ -L "$APP_ROOT/state" ]; then
     state_existed=1
   fi
@@ -980,9 +984,6 @@ install_payload() {
     fi
     if [ "$state_existed" -eq 0 ]; then
       rm -rf "$APP_ROOT/state"
-    fi
-    if [ "$user_data_existed" -eq 0 ]; then
-      rm -rf "$APP_ROOT/user-data"
     fi
   }
 
@@ -1044,7 +1045,6 @@ install_payload() {
     cp -a "$EXTRACTED_PATH/var" "$APP_ROOT/var" \
       || die 'could not install the downloaded var files'
   fi
-  mkdir -p "$APP_ROOT/user-data"
   copy_support_files
   write_native_decoration_patch || die 'could not install the native decoration patch helper'
   launcher_temporary="$temporary_root/chatgpt-launcher"
@@ -1120,7 +1120,6 @@ validate_uninstall_root() {
 }
 
 remove_installation_artifacts() {
-  preserve_app_data=$1
   rm -rf \
     "$APP_ROOT/usr" \
     "$APP_ROOT/etc" \
@@ -1133,9 +1132,6 @@ remove_installation_artifacts() {
     "$APP_ROOT/update-cache"
   rm -f \
     "$APP_ROOT/.chatgpt-install.lock"
-  if [ "$preserve_app_data" -eq 0 ]; then
-    rm -rf "$APP_ROOT/user-data"
-  fi
   for temporary_path in \
     "$APP_ROOT"/.install.* \
     "$APP_ROOT"/.support.* \
@@ -1206,14 +1202,12 @@ uninstall_app() {
     die 'close ChatGPT before uninstalling it'
   fi
   remove_user_launchers
-  remove_installation_artifacts "$preserve_data"
+  remove_installation_artifacts
   if [ "$preserve_data" -eq 0 ]; then
     remove_preserved_data
   fi
 
-  if directory_has_only_user_data; then
-    printf '%s\n' "Uninstalled ChatGPT files from $APP_ROOT; preserved $APP_ROOT/user-data."
-  elif directory_has_content; then
+  if directory_has_content; then
     printf '%s\n' "Uninstalled ChatGPT files from $APP_ROOT."
     printf '%s\n' "The installation directory was kept because it contains unrecognized files: $APP_ROOT"
   else
@@ -1229,13 +1223,17 @@ uninstall_app() {
 
 finish_install() {
   write_config
+  mkdir -p "$USER_DATA_DIRECTORY" \
+    || die "could not create ChatGPT user data directory: $USER_DATA_DIRECTORY"
+  chmod 700 "$USER_DATA_DIRECTORY" \
+    || die "could not secure ChatGPT user data directory: $USER_DATA_DIRECTORY"
   write_command_link
   write_desktop_entry
   printf '%s\n' \
     '' \
-    "Installed ChatGPT/Codex locally in $APP_ROOT" \
-    "Command: $COMMAND_PATH" \
-    'Run `chatgpt` to open the current directory, or `chatgpt update` to update.'
+    "${COLOR_GREEN}${COLOR_BOLD}Installed ChatGPT/Codex locally${COLOR_RESET} in ${COLOR_CYAN}$APP_ROOT${COLOR_RESET}" \
+    "Command: ${COLOR_CYAN}$COMMAND_PATH${COLOR_RESET}" \
+    "Run ${COLOR_YELLOW}${COLOR_BOLD}chatgpt${COLOR_RESET} to open the current directory, or ${COLOR_YELLOW}${COLOR_BOLD}chatgpt update${COLOR_RESET} to update."
   report_command_path
   if command -v codex >/dev/null 2>&1; then
     printf '%s\n' 'Existing codex CLI detected and left unchanged; the desktop app uses its bundled runtime.'
