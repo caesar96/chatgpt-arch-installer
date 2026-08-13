@@ -4,6 +4,6 @@
 // behavior. This hook is intentionally passive: it gives future builds a
 // place for a supported Electron-level implementation without risking startup.
 module.exports = {
-  id: 'native-decoration',
+  id: 'native-window-decorations',
   onLoad() {},
 };

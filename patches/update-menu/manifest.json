@@ -1,6 +1,6 @@
 {
-  "id": "native-decoration",
-  "name": "Native Window Decorations",
+  "id": "update-menu",
+  "name": "Update Menu",
   "version": "1.0.0",
   "entry": "main.js",
   "enabled": false,

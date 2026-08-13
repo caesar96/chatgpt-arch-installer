@@ -4,7 +4,7 @@ set -eu
 APP_ROOT=$1
 PARENT_PID=$2
 CLI_PATH=${3-}
-CLI_PATH=${CLI_PATH:-$APP_ROOT/installer}
+CLI_PATH=${CLI_PATH:-$APP_ROOT/bin/chatgpt}
 PACKAGE_PATH=${4-}
 
 parent_is_running() {
@@ -48,8 +48,8 @@ update_log=$state_directory/update-from-menu.log
 temporary_log=$update_log.$$
 
 relaunch_app() {
-  if [ -x "$APP_ROOT/run-chatgpt" ]; then
-    exec "$APP_ROOT/run-chatgpt"
+  if [ -x "$APP_ROOT/bin/chatgpt-launcher" ]; then
+    exec "$APP_ROOT/bin/chatgpt-launcher"
   fi
   if [ -n "$CLI_PATH" ] && [ -x "$CLI_PATH" ]; then
     exec "$CLI_PATH"
@@ -97,13 +97,13 @@ if ! wait_for_app_exit; then
 fi
 
 if [ -n "$PACKAGE_PATH" ]; then
-  if "$APP_ROOT/installer" install-package "$PACKAGE_PATH" >"$temporary_log" 2>&1; then
+  if "$APP_ROOT/bin/chatgpt" install-package "$PACKAGE_PATH" >"$temporary_log" 2>&1; then
     update_status=0
   else
     update_status=$?
   fi
 else
-  if "$APP_ROOT/installer" update >"$temporary_log" 2>&1; then
+  if "$APP_ROOT/bin/chatgpt" update >"$temporary_log" 2>&1; then
     update_status=0
   else
     update_status=$?

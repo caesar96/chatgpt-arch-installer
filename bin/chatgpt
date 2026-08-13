@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+ENTRYPOINT_PATH=$(readlink -f "$0")
+APP_ROOT=$(CDPATH= cd -- "$(dirname -- "$ENTRYPOINT_PATH")/.." && pwd -P)
+export CHATGPT_ENTRYPOINT=$ENTRYPOINT_PATH
+export CHATGPT_SOURCE_ROOT=$APP_ROOT
+export CHATGPT_CLI_PATH=$ENTRYPOINT_PATH
+
+. "$APP_ROOT/lib/chatgpt-core.sh"
+chatgpt_cli_main "$@"

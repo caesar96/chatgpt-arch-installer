@@ -4,8 +4,8 @@ const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const UPDATE_ITEM_ID = 'chatgpt-external-check-for-updates';
-const DECORATION_ITEM_ID = 'chatgpt-external-native-decorations';
+const UPDATE_ITEM_ID = 'chatgpt-check-for-updates';
+const DECORATION_ITEM_ID = 'chatgpt-native-window-decorations';
 const STARTUP_CHECK_DELAY_MS = 3500;
 
 function diagnostic(message) {
@@ -309,7 +309,7 @@ function checkForUpdates(context, mode = 'manual') {
   if (context.externalActionStarted || context.updateCheckStarted || context.updatePromptStarted || context.updateDownloadStarted) return;
   context.updateCheckStarted = true;
 
-  const cliPath = path.join(context.appRoot, 'installer');
+  const cliPath = path.join(context.appRoot, 'bin', 'chatgpt');
   const parentWindow = getParentWindow(context);
   const checkingWindow = mode === 'manual' ? openCheckingWindow(context, parentWindow) : null;
   const child = spawn(cliPath, ['check-update', mode], {
@@ -408,7 +408,7 @@ function downloadAndInstallUpdate(context, parentWindow, version, etag) {
     }).catch(() => {});
     return;
   }
-  const cliPath = path.join(context.appRoot, 'installer');
+  const cliPath = path.join(context.appRoot, 'bin', 'chatgpt');
   const childArguments = ['download-update'];
   if (etag) childArguments.push(etag);
   const child = spawn(cliPath, childArguments, {
@@ -498,12 +498,12 @@ function spawnAfterQuit(context, helperName, extraArguments = []) {
   if (context.externalActionStarted) return;
   context.externalActionStarted = true;
   const helper = path.join(context.runtimeRoot, helperName);
-  const cliPath = path.join(context.appRoot, 'installer');
+  const cliPath = path.join(context.appRoot, 'bin', 'chatgpt');
   const child = spawn('/bin/sh', [helper, context.appRoot, String(process.pid), cliPath, ...extraArguments], {
     detached: true,
     stdio: 'ignore',
   });
-  child.once('error', (error) => diagnostic(`update-ui: updater helper failed to start: ${error.message}`));
+  child.once('error', (error) => diagnostic(`update-menu: updater helper failed to start: ${error.message}`));
   child.unref();
   context.electron.app.quit();
   // Some packaged builds prevent quit while a local session is active. The
@@ -529,7 +529,7 @@ function addPatchItems(menu, context, MenuItem) {
       label: 'Check for Updates...',
       click: () => checkForUpdates(context, 'manual'),
     }));
-    diagnostic('update-ui: added Check for Updates to Help');
+    diagnostic('update-menu: added Check for Updates to Help');
   }
 
   const decorationMenu = help || findSubmenu(menu, 'view-menu', new Set(['view']));
@@ -543,17 +543,17 @@ function addPatchItems(menu, context, MenuItem) {
       click: () => {
         spawnAfterQuit(
           context,
-          'toggle-native-decoration.sh',
+          'chatgpt-toggle-native-decorations.sh',
           [context.nativeDecorations ? 'disable' : 'enable'],
         );
       },
     }));
-    diagnostic('update-ui: added native decorations to Help');
+    diagnostic('update-menu: added native decorations to Help');
   }
 }
 
 module.exports = {
-  id: 'update-ui',
+  id: 'update-menu',
   onLoad(context) {
     const electron = context.electron;
     const { Menu, MenuItem, app } = electron;
@@ -565,7 +565,7 @@ module.exports = {
       try {
         addPatchItems(menu, context, MenuItem);
       } catch (error) {
-        diagnostic(`update-ui: menu patch failed: ${error.message}`);
+        diagnostic(`update-menu: menu patch failed: ${error.message}`);
         process.emitWarning(`ChatGPT update menu was skipped: ${error.message}`);
       }
       return originalSetApplicationMenu.call(this, menu);

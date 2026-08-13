@@ -5,7 +5,7 @@ APP_ROOT=$1
 PARENT_PID=$2
 CLI_PATH=$3
 ACTION=$4
-CLI_PATH=${CLI_PATH:-$APP_ROOT/installer}
+CLI_PATH=${CLI_PATH:-$APP_ROOT/bin/chatgpt}
 
 parent_is_running() {
   [ -r "/proc/$PARENT_PID/stat" ] || return 1
@@ -46,8 +46,8 @@ state_directory=$APP_ROOT/state
 mkdir -p "$state_directory" 2>/dev/null || true
 
 relaunch_app() {
-  if [ -x "$APP_ROOT/run-chatgpt" ]; then
-    exec "$APP_ROOT/run-chatgpt"
+  if [ -x "$APP_ROOT/bin/chatgpt-launcher" ]; then
+    exec "$APP_ROOT/bin/chatgpt-launcher"
   fi
   if [ -n "$CLI_PATH" ] && [ -x "$CLI_PATH" ]; then
     exec "$CLI_PATH"
@@ -90,7 +90,7 @@ if ! wait_for_app_exit; then
   record_failure "$ACTION"
 fi
 
-if "$CLI_PATH" patches "$ACTION" native-decoration >"$state_directory/native-decoration.log" 2>&1; then
+if "$CLI_PATH" patches "$ACTION" native-window-decorations >"$state_directory/native-decoration.log" 2>&1; then
   printf '%s\n' "$ACTION" > "$state_directory/native-decoration.status"
   if relaunch_app; then
     exit 0

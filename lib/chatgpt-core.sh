@@ -7,17 +7,20 @@ AUTOMATIC_UPDATE_INTERVAL=86400
 METADATA_RANGE_INITIAL_END=65535
 METADATA_RANGE_MAX_END=4194303
 FULL_DOWNLOAD_CHUNK_SIZE=16777216
-CONFIG_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/chatgpt/install.conf
+CONFIG_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/chatgpt/settings.conf
 CONFIG_DIRECTORY=${XDG_CONFIG_HOME:-$HOME/.config}/chatgpt
-DESKTOP_FILE=${XDG_DATA_HOME:-$HOME/.local/share}/applications/chatgpt-local.desktop
+DESKTOP_FILE=${XDG_DATA_HOME:-$HOME/.local/share}/applications/chatgpt.desktop
 MIME_APPS_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/mimeapps.list
 COMMAND_PATH=$HOME/.local/bin/chatgpt
 CODEX_DIRECTORY=$HOME/.codex
 DEFAULT_ROOT=$HOME/Apps/chatgpt-linux
-NATIVE_DECORATION_PATCH=patch-native-decoration.py
+NATIVE_DECORATION_PATCH=chatgpt-native-window-decorations.py
 NATIVE_DECORATION_OVERRIDE=
 PATCHES=
 INSTALLED_PACKAGE_VERSION=
+CONFIG_READ_FILE=
+CHATGPT_SOURCE_ROOT=${CHATGPT_SOURCE_ROOT-}
+CHATGPT_ENTRYPOINT=${CHATGPT_ENTRYPOINT-}
 
 die() {
   printf 'chatgpt: %s\n' "$*" >&2
@@ -26,11 +29,11 @@ die() {
 
 usage() {
   printf '%s\n' \
-    'Usage: install-codex-app.sh [DIRECTORY]' \
-    '       install-codex-app.sh --directory DIRECTORY' \
-    '       install-codex-app.sh --native-window-decoration [DIRECTORY]' \
-    '       install-codex-app.sh --no-native-window-decoration [DIRECTORY]' \
-    '       install-codex-app.sh --check' \
+    'Usage: install-chatgpt.sh [DIRECTORY]' \
+    '       install-chatgpt.sh --directory DIRECTORY' \
+    '       install-chatgpt.sh --native-window-decoration [DIRECTORY]' \
+    '       install-chatgpt.sh --no-native-window-decoration [DIRECTORY]' \
+    '       install-chatgpt.sh --check' \
     '' \
     'Install the ChatGPT/Codex desktop app locally from the latest amd64 DEB.' \
     'No root privileges or system package installation are required.' \
@@ -47,11 +50,11 @@ chatgpt_usage() {
     '  chatgpt patches [list|status|enable NAME|disable NAME]' \
     '  chatgpt --no-patches  Launch once without external patches' \
     '  DECORATION_OPTION: --native-window-decoration or --no-native-window-decoration' \
-    '  NAME: native-decoration or update-ui'
+    '  NAME: native-window-decorations or update-menu'
 }
 
 resolve_self_path() {
-  SELF_PATH=$0
+  SELF_PATH=${CHATGPT_ENTRYPOINT:-$0}
   case "$SELF_PATH" in
     */*) ;;
     *)
@@ -64,9 +67,13 @@ resolve_self_path() {
     /*) ;;
     *) SELF_PATH=$(CDPATH= cd -- "$(dirname -- "$SELF_PATH")" && pwd -P)/$(basename -- "$SELF_PATH") ;;
   esac
-  [ -f "$SELF_PATH" ] || die "installer script cannot be found at $SELF_PATH"
-  INSTALLER_DIRECTORY=$(CDPATH= cd -- "$(dirname -- "$SELF_PATH")" && pwd -P) \
-    || die 'cannot determine the installer directory'
+  [ -f "$SELF_PATH" ] || die "entrypoint cannot be found at $SELF_PATH"
+  if [ -n "$CHATGPT_SOURCE_ROOT" ]; then
+    SOURCE_DIRECTORY=$CHATGPT_SOURCE_ROOT
+  else
+    SOURCE_DIRECTORY=$(CDPATH= cd -- "$(dirname -- "$SELF_PATH")" && pwd -P) \
+      || die 'cannot determine the source directory'
+  fi
 }
 
 check_architecture() {
@@ -78,7 +85,7 @@ check_architecture() {
 
 require_host_tools() {
   missing_tools=
-  for tool in curl ar tar xz mktemp ldd ldconfig awk sort sed tr readlink cp chmod mkdir mv dirname basename id uname pwd rm rmdir ls cat date dd wc xdg-open xdg-mime; do
+  for tool in curl ar tar xz mktemp ldd ldconfig awk sort sed tr readlink cp chmod mkdir mv ln dirname basename id uname pwd rm rmdir ls cat date dd wc xdg-open xdg-mime; do
     if ! command -v "$tool" >/dev/null 2>&1; then
       missing_tools="$missing_tools $tool"
     fi
@@ -96,6 +103,27 @@ set_native_decoration_override() {
     die 'conflicting native decoration options'
   fi
   NATIVE_DECORATION_OVERRIDE=$requested_value
+}
+
+canonical_patch_id() {
+  printf '%s\n' "$1"
+}
+
+normalize_patch_list() {
+  normalized_patches=$(printf '%s\n' "$PATCHES" | awk -F, '
+    {
+      for (position = 1; position <= NF; position++) {
+        patch = $position
+        if (patch == "") continue
+        if (!seen[patch]++) {
+          if (output != "") output = output ","
+          output = output patch
+        }
+      }
+    }
+    END { print output }
+  ')
+  PATCHES=$normalized_patches
 }
 
 parse_native_decoration_option() {
@@ -132,10 +160,10 @@ require_native_decoration_tools() {
   [ "$NATIVE_DECORATIONS" -eq 0 ] && return 0
   command -v python3 >/dev/null 2>&1 \
     || die 'native window decorations require python3'
-  if [ -r "$INSTALLER_DIRECTORY/$NATIVE_DECORATION_PATCH" ]; then
+  if [ -r "$SOURCE_DIRECTORY/runtime/$NATIVE_DECORATION_PATCH" ]; then
     return 0
   fi
-  if [ -n "${APP_ROOT-}" ] && [ -r "$APP_ROOT/$NATIVE_DECORATION_PATCH" ]; then
+  if [ -n "${APP_ROOT-}" ] && [ -r "$APP_ROOT/runtime/$NATIVE_DECORATION_PATCH" ]; then
     return 0
   fi
   die "native decoration patch script is missing: $NATIVE_DECORATION_PATCH"
@@ -274,12 +302,15 @@ is_running_at() {
 
 prepare_install_root() {
   existing_payload=0
-  if [ -x "$APP_ROOT/run-chatgpt" ] && [ -e "$APP_ROOT/usr/lib/chatgpt/ChatGPT" ]; then
+  if [ -x "$APP_ROOT/bin/chatgpt-launcher" ] \
+    && [ -e "$APP_ROOT/usr/lib/chatgpt/ChatGPT" ]; then
     existing_payload=1
   fi
 
   if [ "$existing_payload" -eq 1 ]; then
-    is_running_at "$APP_ROOT" && die 'close ChatGPT before installing or updating it'
+    if is_running_at "$APP_ROOT"; then
+      die 'close ChatGPT before installing or updating it'
+    fi
   else
     if directory_has_content && ! directory_has_only_user_data; then
       die "installation directory is not empty: $APP_ROOT"
@@ -671,15 +702,15 @@ write_run_launcher() {
   printf '%s\n' \
     '#!/bin/sh' \
     'set -eu' \
-    'APP_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)' \
+    'APP_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)' \
     'export CHATGPT_APP_ROOT="$APP_ROOT"' \
     'if [ -r "$APP_ROOT/usr/lib/chatgpt/version" ]; then export CHATGPT_APP_VERSION=$(awk "NR==1 {print; exit}" "$APP_ROOT/usr/lib/chatgpt/version"); fi' \
-    'CONFIG_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/chatgpt/install.conf' \
+    'CONFIG_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/chatgpt/settings.conf' \
     'if [ -r "$CONFIG_FILE" ]; then export CHATGPT_PATCHES=$(awk -F= '\''$1 == "patches" {print $2; exit}'\'' "$CONFIG_FILE"); fi' \
     'if [ -r "$CONFIG_FILE" ]; then export CHATGPT_NATIVE_DECORATIONS=$(awk -F= '\''$1 == "native_decorations" {print $2; exit}'\'' "$CONFIG_FILE"); fi' \
     'if [ "${CHATGPT_NO_PATCHES-0}" != 1 ] && [ -n "${CHATGPT_PATCHES-}" ]; then' \
-    '  export CHATGPT_PATCH_ROOT="$APP_ROOT/external"' \
-    '  export NODE_OPTIONS="${NODE_OPTIONS-} --require=$APP_ROOT/external/runtime/patch-loader.js"' \
+    '  export CHATGPT_PATCH_ROOT="$APP_ROOT"' \
+    '  export NODE_OPTIONS="${NODE_OPTIONS-} --require=$APP_ROOT/runtime/patch-loader.js"' \
     'fi' \
     'exec "$APP_ROOT/usr/lib/chatgpt/ChatGPT" \' \
     '  --user-data-dir="$APP_ROOT/user-data" \' \
@@ -688,10 +719,10 @@ write_run_launcher() {
 }
 
 set_patch_enabled() {
-  patch_id=$1
+  patch_id=$(canonical_patch_id "$1")
   requested_state=$2
   case "$patch_id" in
-    native-decoration|update-ui) ;;
+    native-window-decorations|update-menu) ;;
     *) die "unknown patch: $patch_id" ;;
   esac
 
@@ -704,14 +735,14 @@ set_patch_enabled() {
       ;;
   esac
 
-  if [ "$patch_id" = native-decoration ]; then
+  if [ "$patch_id" = native-window-decorations ]; then
     if [ "$requested_state" = enable ]; then
       require_native_decoration_tools
-      python3 "$APP_ROOT/$NATIVE_DECORATION_PATCH" --apply \
+      python3 "$APP_ROOT/runtime/$NATIVE_DECORATION_PATCH" --apply \
         || die 'native decoration patch could not be applied; restart ChatGPT after fixing the reported build issue'
       NATIVE_DECORATIONS=1
     else
-      python3 "$APP_ROOT/$NATIVE_DECORATION_PATCH" --restore \
+      python3 "$APP_ROOT/runtime/$NATIVE_DECORATION_PATCH" --restore \
         || die 'native decoration patch could not be restored'
       NATIVE_DECORATIONS=0
     fi
@@ -720,76 +751,92 @@ set_patch_enabled() {
   printf 'Patch %s %sd. Restart ChatGPT for the change to take effect.\n' "$patch_id" "$requested_state"
 }
 
-write_installed_cli() {
-  cli_source="$INSTALLER_DIRECTORY/templates/chatgpt"
-  if [ ! -r "$cli_source" ]; then
-    cli_source="$APP_ROOT/external/templates/chatgpt"
+copy_support_files() {
+  support_source="$SOURCE_DIRECTORY"
+  if [ ! -r "$support_source/lib/chatgpt-core.sh" ]; then
+    support_source="$APP_ROOT"
   fi
-  [ -r "$cli_source" ] || die "installed CLI template is missing: $cli_source"
-  cli_temporary="$APP_ROOT/cli.$$"
-  cli_root=$(printf '%s' "$APP_ROOT" | sed "s/'/'\\\\''/g" | sed 's/[\\&|]/\\&/g')
-  sed "s|__CHATGPT_APP_ROOT__|$cli_root|" "$cli_source" > "$cli_temporary"
-  chmod u+x "$cli_temporary"
-  mv -f "$cli_temporary" "$COMMAND_PATH"
+  for support_file in \
+    "$support_source/lib/chatgpt-core.sh" \
+    "$support_source/bin/chatgpt" \
+    "$support_source/runtime/patch-loader.js" \
+    "$support_source/runtime/chatgpt-update-from-menu.sh" \
+    "$support_source/runtime/chatgpt-toggle-native-decorations.sh" \
+    "$support_source/runtime/chatgpt-native-window-decorations.py"; do
+    [ -r "$support_file" ] || die "required ChatGPT support file is missing: $support_file"
+  done
+
+  support_temporary="$APP_ROOT/.support.$$"
+  rm -rf "$support_temporary"
+  mkdir -p "$support_temporary/bin" "$support_temporary/lib" "$support_temporary/runtime" "$support_temporary/patches"
+  cp "$support_source/lib/chatgpt-core.sh" "$support_temporary/lib/chatgpt-core.sh"
+  cp "$support_source/bin/chatgpt" "$support_temporary/bin/chatgpt"
+  cp "$support_source/runtime/patch-loader.js" "$support_temporary/runtime/patch-loader.js"
+  cp "$support_source/runtime/chatgpt-update-from-menu.sh" "$support_temporary/runtime/chatgpt-update-from-menu.sh"
+  cp "$support_source/runtime/chatgpt-toggle-native-decorations.sh" "$support_temporary/runtime/chatgpt-toggle-native-decorations.sh"
+  cp "$support_source/runtime/chatgpt-native-window-decorations.py" "$support_temporary/runtime/chatgpt-native-window-decorations.py"
+  cp -a "$support_source/patches/update-menu" "$support_temporary/patches/"
+  cp -a "$support_source/patches/native-window-decorations" "$support_temporary/patches/"
+  chmod 644 "$support_temporary/lib/chatgpt-core.sh" "$support_temporary/runtime/patch-loader.js" "$support_temporary/patches"/*/*.js "$support_temporary/patches"/*/*.json
+  chmod 755 "$support_temporary/bin/chatgpt" "$support_temporary/runtime/chatgpt-native-window-decorations.py"
+  chmod 755 "$support_temporary/runtime/chatgpt-update-from-menu.sh" "$support_temporary/runtime/chatgpt-toggle-native-decorations.sh"
+
+  backup_support="$temporary_root/original-support"
+  if [ -e "$APP_ROOT/bin" ] || [ -e "$APP_ROOT/lib" ] || [ -e "$APP_ROOT/runtime" ] || [ -e "$APP_ROOT/patches" ]; then
+    mkdir -p "$backup_support"
+    for support_directory in bin lib runtime patches; do
+      if [ -e "$APP_ROOT/$support_directory" ]; then
+        mv "$APP_ROOT/$support_directory" "$backup_support/$support_directory" \
+          || die "could not back up existing $support_directory files"
+      fi
+    done
+  fi
+  support_replaced=1
+  for support_directory in bin lib runtime patches; do
+    mv "$support_temporary/$support_directory" "$APP_ROOT/$support_directory" \
+      || die "could not install $support_directory files"
+  done
+  rmdir "$support_temporary" 2>/dev/null || true
 }
 
-copy_external_files() {
-  external_source="$INSTALLER_DIRECTORY"
-  if [ ! -r "$external_source/runtime/patch-loader.js" ]; then
-    external_source="$APP_ROOT/external"
+write_command_link() {
+  command_directory=$(dirname -- "$COMMAND_PATH")
+  mkdir -p "$command_directory"
+  if [ -e "$COMMAND_PATH" ] || [ -L "$COMMAND_PATH" ]; then
+    command_target=$(readlink -f "$COMMAND_PATH" 2>/dev/null || true)
+    if [ -L "$COMMAND_PATH" ] && [ "$command_target" = "$APP_ROOT/bin/chatgpt" ]; then
+      rm -f "$COMMAND_PATH"
+    else
+      die "refusing to replace an existing command: $COMMAND_PATH"
+    fi
   fi
-  external_temporary="$APP_ROOT/.external.$$"
-  rm -rf "$external_temporary"
-  mkdir -p "$external_temporary/runtime" "$external_temporary/patches" "$external_temporary/templates"
-  cp "$external_source/runtime/patch-loader.js" "$external_temporary/runtime/patch-loader.js"
-  cp "$external_source/runtime/update-from-menu.sh" "$external_temporary/runtime/update-from-menu.sh"
-  cp "$external_source/runtime/toggle-native-decoration.sh" "$external_temporary/runtime/toggle-native-decoration.sh"
-  cp "$external_source/patch-native-decoration.py" "$external_temporary/patch-native-decoration.py"
-  cp -a "$external_source/patches/native-decoration" "$external_temporary/patches/"
-  cp -a "$external_source/patches/update-ui" "$external_temporary/patches/"
-  cp "$external_source/templates/chatgpt" "$external_temporary/templates/chatgpt"
-  chmod 644 "$external_temporary/runtime/patch-loader.js" "$external_temporary/patches"/*/*.js "$external_temporary/patches"/*/*.json
-  chmod 755 "$external_temporary/patch-native-decoration.py"
-  chmod 755 "$external_temporary/runtime/update-from-menu.sh"
-  chmod 755 "$external_temporary/runtime/toggle-native-decoration.sh"
-  if [ -e "$APP_ROOT/external" ]; then
-    mv "$APP_ROOT/external" "$backup_external" \
-      || die 'could not back up the existing external patch files'
-  fi
-  if ! mv "$external_temporary" "$APP_ROOT/external"; then
-    rm -rf "$external_temporary"
-    [ ! -e "$backup_external" ] || mv "$backup_external" "$APP_ROOT/external" || true
-    die 'could not install the external patch files'
-  fi
-  external_replaced=1
+  ln -s "$APP_ROOT/bin/chatgpt" "$COMMAND_PATH"
 }
 
 write_native_decoration_patch() {
   patch_source=
-  if [ -r "$INSTALLER_DIRECTORY/$NATIVE_DECORATION_PATCH" ]; then
-    patch_source=$INSTALLER_DIRECTORY/$NATIVE_DECORATION_PATCH
-  elif [ -r "$APP_ROOT/external/$NATIVE_DECORATION_PATCH" ]; then
-    patch_source=$APP_ROOT/external/$NATIVE_DECORATION_PATCH
-  elif [ -r "$APP_ROOT/$NATIVE_DECORATION_PATCH" ]; then
-    patch_source=$APP_ROOT/$NATIVE_DECORATION_PATCH
+  if [ -r "$SOURCE_DIRECTORY/runtime/$NATIVE_DECORATION_PATCH" ]; then
+    patch_source=$SOURCE_DIRECTORY/runtime/$NATIVE_DECORATION_PATCH
+  elif [ -r "$APP_ROOT/runtime/$NATIVE_DECORATION_PATCH" ]; then
+    patch_source=$APP_ROOT/runtime/$NATIVE_DECORATION_PATCH
   fi
   if [ -z "$patch_source" ]; then
     printf 'chatgpt: native decoration patch script is missing: %s\n' "$NATIVE_DECORATION_PATCH" >&2
     return 1
   fi
 
-  patch_temporary="$APP_ROOT/$NATIVE_DECORATION_PATCH.$$"
+  patch_temporary="$APP_ROOT/runtime/$NATIVE_DECORATION_PATCH.$$"
   if ! cp "$patch_source" "$patch_temporary"; then
     printf '%s\n' 'chatgpt: could not install the native decoration patch script' >&2
     return 1
   fi
   chmod u+x "$patch_temporary"
-  mv -f "$patch_temporary" "$APP_ROOT/$NATIVE_DECORATION_PATCH"
+  mv -f "$patch_temporary" "$APP_ROOT/runtime/$NATIVE_DECORATION_PATCH"
 }
 
 apply_native_decoration_patch() {
   [ "$NATIVE_DECORATIONS" -eq 1 ] || return 0
-  python3 "$APP_ROOT/$NATIVE_DECORATION_PATCH" --apply || return 1
+  python3 "$APP_ROOT/runtime/$NATIVE_DECORATION_PATCH" --apply || return 1
   printf '%s\n' 'Native system window decorations enabled.'
 }
 
@@ -800,26 +847,6 @@ write_config() {
   printf '%s\n' "$APP_ROOT" "native_decorations=$NATIVE_DECORATIONS" "patches=$PATCHES" "package_version=${INSTALLED_PACKAGE_VERSION-}" > "$config_temporary"
   chmod 600 "$config_temporary"
   mv -f "$config_temporary" "$CONFIG_FILE"
-}
-
-write_command_copy() {
-  command_directory=$(dirname -- "$COMMAND_PATH")
-  mkdir -p "$command_directory"
-  write_installed_cli
-  installer_temporary="$APP_ROOT/installer.$$"
-  cp "$SELF_PATH" "$installer_temporary"
-  chmod u+x "$installer_temporary"
-  mv -f "$installer_temporary" "$APP_ROOT/installer"
-  patch_source="$INSTALLER_DIRECTORY/$NATIVE_DECORATION_PATCH"
-  if [ -r "$patch_source" ]; then
-    patch_destination="$command_directory/$NATIVE_DECORATION_PATCH"
-    if [ "$patch_source" != "$patch_destination" ]; then
-      patch_command_temporary="$patch_destination.$$"
-      cp "$patch_source" "$patch_command_temporary"
-      chmod u+x "$patch_command_temporary"
-      mv -f "$patch_command_temporary" "$patch_destination"
-    fi
-  fi
 }
 
 write_desktop_entry() {
@@ -835,7 +862,7 @@ write_desktop_entry() {
     'Type=Application' \
     'Terminal=false' \
     'StartupNotify=true' \
-    'Categories=Utility;Development;' \
+    'Categories=Utility;' \
     'MimeType=x-scheme-handler/codex;text/csv;application/vnd.openxmlformats-officedocument.wordprocessingml.document;application/vnd.openxmlformats-officedocument.presentationml.presentation;text/tab-separated-values;application/vnd.ms-excel;application/vnd.ms-excel.sheet.macroEnabled.12;application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;' > "$DESKTOP_FILE"
   chmod 644 "$DESKTOP_FILE"
 
@@ -871,21 +898,24 @@ install_payload() {
     || die "cannot create a temporary directory inside $APP_ROOT"
   EXTRACTED_PATH="$temporary_root/extracted"
   backup_usr="$temporary_root/original-usr"
-  backup_external="$temporary_root/original-external"
+  backup_support="$temporary_root/original-support"
   payload_replaced=0
-  external_replaced=0
+  support_replaced=0
   payload_install_succeeded=0
 
   rollback_payload() {
-    if [ "$external_replaced" -eq 1 ]; then
-      failed_external="$temporary_root/failed-external"
-      if [ -e "$APP_ROOT/external" ]; then
-        mv "$APP_ROOT/external" "$failed_external" || true
-      fi
-      if [ -e "$backup_external" ]; then
-        mv "$backup_external" "$APP_ROOT/external" || true
-      fi
-      external_replaced=0
+    if [ "$support_replaced" -eq 1 ]; then
+      failed_support="$temporary_root/failed-support"
+      mkdir -p "$failed_support"
+      for support_directory in bin lib runtime patches; do
+        if [ -e "$APP_ROOT/$support_directory" ]; then
+          mv "$APP_ROOT/$support_directory" "$failed_support/$support_directory" || true
+        fi
+        if [ -e "$backup_support/$support_directory" ]; then
+          mv "$backup_support/$support_directory" "$APP_ROOT/$support_directory" || true
+        fi
+      done
+      support_replaced=0
     fi
     if [ "$payload_replaced" -eq 1 ]; then
       failed_usr="$temporary_root/failed-usr"
@@ -943,11 +973,11 @@ install_payload() {
   [ ! -e "$EXTRACTED_PATH/etc" ] || cp -a "$EXTRACTED_PATH/etc" "$APP_ROOT/etc"
   [ ! -e "$EXTRACTED_PATH/var" ] || cp -a "$EXTRACTED_PATH/var" "$APP_ROOT/var"
   mkdir -p "$APP_ROOT/user-data"
-  copy_external_files
+  copy_support_files
   write_native_decoration_patch || die 'could not install the native decoration patch helper'
-  launcher_temporary="$temporary_root/run-chatgpt"
+  launcher_temporary="$temporary_root/chatgpt-launcher"
   write_run_launcher "$launcher_temporary"
-  mv -f "$launcher_temporary" "$APP_ROOT/run-chatgpt"
+  mv -f "$launcher_temporary" "$APP_ROOT/bin/chatgpt-launcher"
   if [ "$NATIVE_DECORATIONS" -eq 1 ]; then
     if ! write_native_decoration_patch || ! apply_native_decoration_patch; then
       rollback_payload
@@ -959,45 +989,47 @@ install_payload() {
 
 load_configured_root() {
   load_mode=${1-}
-  [ -r "$CONFIG_FILE" ] || die 'not configured; run install-codex-app.sh first'
-  IFS= read -r APP_ROOT < "$CONFIG_FILE" || true
+  CONFIG_READ_FILE=$CONFIG_FILE
+  [ -r "$CONFIG_READ_FILE" ] || die 'not configured; run install-chatgpt.sh first'
+  IFS= read -r APP_ROOT < "$CONFIG_READ_FILE" || true
   [ -n "${APP_ROOT-}" ] || die "installation directory is empty in $CONFIG_FILE"
   case "$APP_ROOT" in
     /*) ;;
     *) die "installation directory must be absolute: $APP_ROOT" ;;
   esac
   if [ "$load_mode" != uninstall ]; then
-    [ -x "$APP_ROOT/run-chatgpt" ] || die "launcher not found in $APP_ROOT"
+    [ -x "$APP_ROOT/bin/chatgpt-launcher" ] || die "ChatGPT launcher not found in $APP_ROOT"
   fi
   [ "$load_mode" = uninstall ] && return 0
-  NATIVE_DECORATIONS=$(awk -F= '$1 == "native_decorations" {print $2; exit}' "$CONFIG_FILE")
+  NATIVE_DECORATIONS=$(awk -F= '$1 == "native_decorations" {print $2; exit}' "$CONFIG_READ_FILE")
   NATIVE_DECORATIONS=${NATIVE_DECORATIONS:-0}
   case "$NATIVE_DECORATIONS" in
     0|1) ;;
     *) die "invalid native decoration setting in $CONFIG_FILE" ;;
   esac
-  PATCHES=$(awk -F= '$1 == "patches" {print $2; exit}' "$CONFIG_FILE")
-  INSTALLED_PACKAGE_VERSION=$(awk -F= '$1 == "package_version" {print $2; exit}' "$CONFIG_FILE")
+  PATCHES=$(awk -F= '$1 == "patches" {print $2; exit}' "$CONFIG_READ_FILE")
+  INSTALLED_PACKAGE_VERSION=$(awk -F= '$1 == "package_version" {print $2; exit}' "$CONFIG_READ_FILE")
   if [ -z "$INSTALLED_PACKAGE_VERSION" ] \
     && [ -r "$APP_ROOT/usr/lib/chatgpt/resources/linux-package-metadata.json" ]; then
     INSTALLED_PACKAGE_VERSION=$(awk -F'"' '$2 == "version" {print $4; exit}' \
       "$APP_ROOT/usr/lib/chatgpt/resources/linux-package-metadata.json")
   fi
-  patches_setting=$(awk -F= '$1 == "patches" {print "present"; exit}' "$CONFIG_FILE")
+  patches_setting=$(awk -F= '$1 == "patches" {print "present"; exit}' "$CONFIG_READ_FILE")
   if [ -z "$patches_setting" ]; then
-    PATCHES=update-ui
+    PATCHES=update-menu
     if [ "$NATIVE_DECORATIONS" -eq 1 ]; then
-      PATCHES=$PATCHES,native-decoration
-    elif [ -x "$APP_ROOT/$NATIVE_DECORATION_PATCH" ] && command -v python3 >/dev/null 2>&1; then
-      native_patch_status=$(python3 "$APP_ROOT/$NATIVE_DECORATION_PATCH" --status 2>/dev/null || true)
+      PATCHES=$PATCHES,native-window-decorations
+    elif [ -x "$APP_ROOT/runtime/$NATIVE_DECORATION_PATCH" ] && command -v python3 >/dev/null 2>&1; then
+      native_patch_status=$(python3 "$APP_ROOT/runtime/$NATIVE_DECORATION_PATCH" --status 2>/dev/null || true)
       case "$native_patch_status" in
         *'Native decoration patch: applied'*)
           NATIVE_DECORATIONS=1
-          PATCHES=$PATCHES,native-decoration
+          PATCHES=$PATCHES,native-window-decorations
           ;;
       esac
     fi
   fi
+  normalize_patch_list
 }
 
 validate_uninstall_root() {
@@ -1021,37 +1053,39 @@ remove_installation_artifacts() {
     "$APP_ROOT/usr" \
     "$APP_ROOT/etc" \
     "$APP_ROOT/var" \
-    "$APP_ROOT/external" \
+    "$APP_ROOT/bin" \
+    "$APP_ROOT/lib" \
+    "$APP_ROOT/runtime" \
+    "$APP_ROOT/patches" \
     "$APP_ROOT/state" \
     "$APP_ROOT/update-cache"
   rm -f \
-    "$APP_ROOT/run-chatgpt" \
-    "$APP_ROOT/installer" \
-    "$APP_ROOT/patch-native-decoration.py" \
-    "$APP_ROOT/patch-native-decoration.lock"
+    "$APP_ROOT/.chatgpt-install.lock"
   if [ "$preserve_app_data" -eq 0 ]; then
     rm -rf "$APP_ROOT/user-data"
   fi
   for temporary_path in \
     "$APP_ROOT"/.install.* \
-    "$APP_ROOT"/.external.* \
+    "$APP_ROOT"/.support.* \
     "$APP_ROOT"/cli.* \
-    "$APP_ROOT"/installer.* \
-    "$APP_ROOT"/run-chatgpt.* \
-    "$APP_ROOT"/patch-native-decoration.py.*; do
+    "$APP_ROOT"/chatgpt-launcher.*; do
     [ -e "$temporary_path" ] || [ -L "$temporary_path" ] || continue
     rm -rf "$temporary_path"
   done
 }
 
 remove_user_launchers() {
-  rm -f "$COMMAND_PATH" "$HOME/.local/bin/$NATIVE_DECORATION_PATCH" "$DESKTOP_FILE"
+  command_target=$(readlink -f "$COMMAND_PATH" 2>/dev/null || true)
+  if [ "$command_target" = "$APP_ROOT/bin/chatgpt" ]; then
+    rm -f "$COMMAND_PATH"
+  fi
+  rm -f "$DESKTOP_FILE"
   if [ -f "$MIME_APPS_FILE" ] && [ ! -L "$MIME_APPS_FILE" ]; then
     mime_apps_temporary="$MIME_APPS_FILE.$$"
     mime_apps_removed=0
     while IFS= read -r mime_apps_line || [ -n "$mime_apps_line" ]; do
       case "$mime_apps_line" in
-        'x-scheme-handler/codex=chatgpt-local.desktop'|'x-scheme-handler/codex=chatgpt-local.desktop;')
+        'x-scheme-handler/codex=chatgpt.desktop'|'x-scheme-handler/codex=chatgpt.desktop;')
           mime_apps_removed=1
           ;;
         *) printf '%s\n' "$mime_apps_line" ;;
@@ -1096,7 +1130,9 @@ uninstall_app() {
     esac
   done
   validate_uninstall_root
-  is_running_at "$APP_ROOT" && die 'close ChatGPT before uninstalling it'
+  if is_running_at "$APP_ROOT"; then
+    die 'close ChatGPT before uninstalling it'
+  fi
   remove_user_launchers
   remove_installation_artifacts "$preserve_data"
   if [ "$preserve_data" -eq 0 ]; then
@@ -1121,7 +1157,7 @@ uninstall_app() {
 
 finish_install() {
   write_config
-  write_command_copy
+  write_command_link
   write_desktop_entry
   printf '%s\n' \
     '' \
@@ -1142,8 +1178,8 @@ install_app() {
   check_host_libraries || exit 1
   check_desktop_helpers || exit 1
   ask_native_decoration_preference
-  PATCHES=update-ui
-  [ "$NATIVE_DECORATIONS" -eq 0 ] || PATCHES=$PATCHES,native-decoration
+  PATCHES=update-menu
+  [ "$NATIVE_DECORATIONS" -eq 0 ] || PATCHES=$PATCHES,native-window-decorations
   resolve_install_root "$1"
   require_native_decoration_tools
   prepare_install_root
@@ -1161,13 +1197,15 @@ update_app() {
   if [ -n "$NATIVE_DECORATION_OVERRIDE" ]; then
     NATIVE_DECORATIONS=$NATIVE_DECORATION_OVERRIDE
     if [ "$NATIVE_DECORATIONS" -eq 1 ]; then
-      case ",$PATCHES," in *,native-decoration,*) ;; *) PATCHES=${PATCHES:+$PATCHES,}native-decoration ;; esac
+      case ",$PATCHES," in *,native-window-decorations,*) ;; *) PATCHES=${PATCHES:+$PATCHES,}native-window-decorations ;; esac
     else
-      PATCHES=$(printf '%s' ",$PATCHES," | awk -v p=",native-decoration," '{gsub(p,""); gsub(/^,|,$/,""); gsub(/,,+/,","); print}')
+      PATCHES=$(printf '%s' ",$PATCHES," | awk -v p=",native-window-decorations," '{gsub(p,""); gsub(/^,|,$/,""); gsub(/,,+/,","); print}')
     fi
   fi
   require_native_decoration_tools
-  is_running_at "$APP_ROOT" && die 'close ChatGPT before updating it'
+  if is_running_at "$APP_ROOT"; then
+    die 'close ChatGPT before updating it'
+  fi
   install_payload
   finish_install
   payload_install_succeeded=1
@@ -1245,13 +1283,16 @@ install_package_app() {
   check_host_libraries || exit 1
   check_desktop_helpers || exit 1
   require_native_decoration_tools
-  is_running_at "$APP_ROOT" && die 'close ChatGPT before updating it'
+  if is_running_at "$APP_ROOT"; then
+    die 'close ChatGPT before updating it'
+  fi
   install_payload "$package_path"
   finish_install
   payload_install_succeeded=1
 }
 
-run_chatgpt() {
+chatgpt_cli_main() {
+  resolve_self_path
   NO_PATCHES=0
   if [ "$#" -gt 0 ]; then
     case "$1" in
@@ -1275,7 +1316,7 @@ run_chatgpt() {
        if [ "$NO_PATCHES" -eq 1 ]; then export CHATGPT_NO_PATCHES=1; fi
        export CHATGPT_PATCHES=$PATCHES
        export CHATGPT_APP_ROOT=$APP_ROOT
-       exec "$APP_ROOT/run-chatgpt" --open-project "$PWD"
+       exec "$APP_ROOT/bin/chatgpt-launcher" --open-project "$PWD"
       ;;
     update)
       shift
@@ -1307,7 +1348,7 @@ run_chatgpt() {
       [ "$NO_PATCHES" -eq 0 ] || die '--no-patches cannot be used with patch management'
       shift
       case "${1-}" in
-        list) printf '%s\n' 'native-decoration' 'update-ui' ;;
+        list) printf '%s\n' 'native-window-decorations' 'update-menu' ;;
         status) printf 'Enabled patches: %s\n' "${PATCHES:-none}" ;;
          enable|disable)
            [ "$#" -eq 2 ] || die 'usage: chatgpt patches enable|disable NAME'
@@ -1325,33 +1366,28 @@ run_chatgpt() {
     *)
       [ -z "$NATIVE_DECORATION_OVERRIDE" ] \
         || die 'decoration options can only be used with `chatgpt update`'
-      exec "$APP_ROOT/run-chatgpt" "$@"
+      exec "$APP_ROOT/bin/chatgpt-launcher" "$@"
       ;;
   esac
 }
 
-resolve_self_path
-
-INSTALLER_ACTION=install
-INSTALL_DIRECTORY=
-
-parse_installer_arguments() {
+parse_install_arguments() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --help|-h)
-        [ "$INSTALLER_ACTION" = install ] || die 'conflicting installer options'
-        INSTALLER_ACTION=help
+        [ "$INSTALL_ACTION" = install ] || die 'conflicting installation options'
+        INSTALL_ACTION=help
         ;;
       --check)
-        [ "$INSTALLER_ACTION" = install ] || die 'conflicting installer options'
-        INSTALLER_ACTION=check
+        [ "$INSTALL_ACTION" = install ] || die 'conflicting installation options'
+        INSTALL_ACTION=check
         ;;
       --native-window-decoration|--no-native-window-decoration)
-        [ "$INSTALLER_ACTION" = install ] || die 'conflicting installer options'
+        [ "$INSTALL_ACTION" = install ] || die 'conflicting installation options'
         parse_native_decoration_option "$1"
         ;;
       --directory)
-        [ "$INSTALLER_ACTION" = install ] || die 'conflicting installer options'
+        [ "$INSTALL_ACTION" = install ] || die 'conflicting installation options'
         shift
         [ "$#" -gt 0 ] || die 'missing directory after --directory'
         [ -z "$INSTALL_DIRECTORY" ] || die 'installation directory was specified more than once'
@@ -1364,10 +1400,10 @@ parse_installer_arguments() {
         INSTALL_DIRECTORY=$1
         ;;
       -*)
-        die "unknown installer option: $1"
+        die "unknown installation option: $1"
         ;;
       *)
-        [ "$INSTALLER_ACTION" = install ] || die 'conflicting installer options'
+        [ "$INSTALL_ACTION" = install ] || die 'conflicting installation options'
         [ -z "$INSTALL_DIRECTORY" ] || die 'installation directory was specified more than once'
         INSTALL_DIRECTORY=$1
         ;;
@@ -1376,31 +1412,31 @@ parse_installer_arguments() {
   done
 }
 
-if [ "${0##*/}" = chatgpt ] || [ "${0##*/}" = installer ]; then
-  run_chatgpt "$@"
-  exit 0
-fi
+chatgpt_install_main() {
+  resolve_self_path
+  INSTALL_ACTION=install
+  INSTALL_DIRECTORY=
+  parse_install_arguments "$@"
 
-parse_installer_arguments "$@"
-
-case "$INSTALLER_ACTION" in
-  help)
-    usage
-    ;;
-  check)
-    check_architecture
-    require_host_tools || exit 1
-    check_host_libraries || exit 1
-    check_desktop_helpers || exit 1
-    printf '%s\n' 'Host checks passed. The downloaded DEB will be checked again after extraction.'
-    ;;
-  install)
-    if [ -n "$INSTALL_DIRECTORY" ]; then
-      install_app "$INSTALL_DIRECTORY"
-    else
-      printf 'Install directory [%s]: ' "$DEFAULT_ROOT"
-      IFS= read -r selected_root || exit 1
-      [ -n "$selected_root" ] || selected_root=$DEFAULT_ROOT
-      install_app "$selected_root"
-    fi
-esac
+  case "$INSTALL_ACTION" in
+    help)
+      usage
+      ;;
+    check)
+      check_architecture
+      require_host_tools || exit 1
+      check_host_libraries || exit 1
+      check_desktop_helpers || exit 1
+      printf '%s\n' 'Host checks passed. The downloaded DEB will be checked again after extraction.'
+      ;;
+    install)
+      if [ -n "$INSTALL_DIRECTORY" ]; then
+        install_app "$INSTALL_DIRECTORY"
+      else
+        printf 'Install directory [%s]: ' "$DEFAULT_ROOT"
+        IFS= read -r selected_root || exit 1
+        [ -n "$selected_root" ] || selected_root=$DEFAULT_ROOT
+        install_app "$selected_root"
+      fi
+  esac
+}

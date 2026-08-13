@@ -13,11 +13,11 @@ import tempfile
 from pathlib import Path
 
 
-APP_ROOT = Path(__file__).resolve().parent
+APP_ROOT = Path(__file__).resolve().parent.parent
 ARCHIVE = APP_ROOT / "usr/lib/chatgpt/resources/app.asar"
 EXECUTABLE = APP_ROOT / "usr/lib/chatgpt/ChatGPT"
 VERSION_FILE = APP_ROOT / "usr/lib/chatgpt/version"
-LOCK_FILE = APP_ROOT / "patch-native-decoration.lock"
+LOCK_FILE = APP_ROOT / "state" / "native-window-decorations.lock"
 
 
 def same_size(source: bytes, replacement: bytes) -> bytes:
