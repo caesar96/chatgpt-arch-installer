@@ -14,6 +14,7 @@ The package is currently distributed as an `amd64` Debian package. This installe
 - Creates a user-level `chatgpt` command
 - Makes `chatgpt` open the current terminal directory as a project
 - Makes `chatgpt update` update the local application
+- Provides `chatgpt uninstall` with safe data preservation by default
 - Installs an app-local `installer` backend and a user-level `chatgpt` wrapper
 - Preserves the local application profile and login data during updates
 - Creates a user-level desktop launcher
@@ -34,7 +35,7 @@ The installer currently targets:
 
 The installer checks for these host tools:
 
-`curl`, `ar`, `tar`, `xz`, `mktemp`, `ldd`, `ldconfig`, `awk`, `sort`, `sed`, `tr`, `readlink`, `cat`, `date`, `dd`, `wc`, `xdg-open`, and `xdg-mime`.
+`curl`, `ar`, `tar`, `xz`, `mktemp`, `ldd`, `ldconfig`, `awk`, `sort`, `sed`, `tr`, `readlink`, `cat`, `date`, `dd`, `wc`, `rmdir`, `xdg-open`, and `xdg-mime`.
 
 It also checks the GUI libraries required by the Electron application and verifies the dynamic dependencies of the bundled Electron and Codex executables. On CachyOS, these are normally provided by the standard desktop and multimedia packages.
 
@@ -126,6 +127,7 @@ same file. It then routes commands as follows:
 | `chatgpt` | Launches ChatGPT with `--open-project "$PWD"`. |
 | `chatgpt [APP_OPTIONS...]` | Launches ChatGPT with the supplied Electron/app arguments. |
 | `chatgpt update [OPTIONS...]` | Runs the app-local installer backend and replaces the application payload after ChatGPT is closed. |
+| `chatgpt uninstall [--no-preserve-data]` | Removes the local application, launcher, and desktop entry. Preserves data unless the flag is supplied. |
 | `chatgpt check-update` | Checks remote package metadata without downloading the full `.deb`. |
 | `chatgpt patches ...` | Lists, reports, enables, or disables external patches. |
 | `chatgpt --no-patches [APP_OPTIONS...]` | Launches once without loading external patches. |
@@ -151,6 +153,28 @@ chatgpt update --no-native-window-decoration
 ```
 
 The override is saved and becomes the preference used by later updates.
+
+Uninstall the local application:
+
+```bash
+chatgpt uninstall
+```
+
+The default uninstall removes the application payload, update state, external
+patches, command launcher, desktop entry, and native-decoration helper. It
+keeps `<chosen-directory>/user-data`, `~/.codex`, and `~/.config/chatgpt` so a
+later installation can reuse the profile and existing authentication. The
+installation directory is retained when it contains the preserved
+`user-data` directory.
+
+To remove those data directories as well, use the explicit destructive option:
+
+```bash
+chatgpt uninstall --no-preserve-data
+```
+
+This also removes `~/.codex` and the ChatGPT configuration file. ChatGPT must
+be closed before either uninstall mode can run.
 
 Manage external patches:
 
@@ -287,6 +311,8 @@ The installer creates these user-level files:
 preference, enabled patches, and the installed Debian package version. The
 installer does not modify `~/.codex/auth.json`; that file remains available to
 the bundled Codex runtime and preserves the existing authenticated session.
+The default `chatgpt uninstall` preserves these profile and authentication
+paths; `chatgpt uninstall --no-preserve-data` removes them.
 
 The installer does not write to `/usr`, `/opt`, `/etc`, or system package databases.
 

@@ -8,8 +8,11 @@ METADATA_RANGE_INITIAL_END=65535
 METADATA_RANGE_MAX_END=4194303
 FULL_DOWNLOAD_CHUNK_SIZE=16777216
 CONFIG_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/chatgpt/install.conf
+CONFIG_DIRECTORY=${XDG_CONFIG_HOME:-$HOME/.config}/chatgpt
 DESKTOP_FILE=${XDG_DATA_HOME:-$HOME/.local/share}/applications/chatgpt-local.desktop
+MIME_APPS_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/mimeapps.list
 COMMAND_PATH=$HOME/.local/bin/chatgpt
+CODEX_DIRECTORY=$HOME/.codex
 DEFAULT_ROOT=$HOME/Apps/chatgpt-linux
 NATIVE_DECORATION_PATCH=patch-native-decoration.py
 NATIVE_DECORATION_OVERRIDE=
@@ -40,6 +43,7 @@ chatgpt_usage() {
     '  chatgpt         Open ChatGPT in the current terminal directory' \
     '  chatgpt update  Download and install the latest app version' \
     '  chatgpt check-update  Check remote package metadata' \
+    '  chatgpt uninstall [--no-preserve-data]  Remove the local installation' \
     '  chatgpt patches [list|status|enable NAME|disable NAME]' \
     '  chatgpt --no-patches  Launch once without external patches' \
     '  DECORATION_OPTION: --native-window-decoration or --no-native-window-decoration' \
@@ -74,7 +78,7 @@ check_architecture() {
 
 require_host_tools() {
   missing_tools=
-  for tool in curl ar tar xz mktemp ldd ldconfig awk sort sed tr readlink cp chmod mkdir mv dirname basename id uname pwd rm ls cat date dd wc xdg-open xdg-mime; do
+  for tool in curl ar tar xz mktemp ldd ldconfig awk sort sed tr readlink cp chmod mkdir mv dirname basename id uname pwd rm rmdir ls cat date dd wc xdg-open xdg-mime; do
     if ! command -v "$tool" >/dev/null 2>&1; then
       missing_tools="$missing_tools $tool"
     fi
@@ -239,10 +243,23 @@ resolve_install_root() {
 
 directory_has_content() {
   for candidate in "$APP_ROOT"/* "$APP_ROOT"/.[!.]* "$APP_ROOT"/..?*; do
-    [ -e "$candidate" ] || continue
+    [ -e "$candidate" ] || [ -L "$candidate" ] || continue
     return 0
   done
   return 1
+}
+
+directory_has_only_user_data() {
+  [ -r "$CONFIG_FILE" ] || return 1
+  configured_root=$(awk 'NR == 1 {print; exit}' "$CONFIG_FILE")
+  [ "$configured_root" = "$APP_ROOT" ] || return 1
+  [ -d "$APP_ROOT/user-data" ] || [ -L "$APP_ROOT/user-data" ] || return 1
+  [ ! -L "$APP_ROOT/user-data" ] || return 1
+  for candidate in "$APP_ROOT"/* "$APP_ROOT"/.[!.]* "$APP_ROOT"/..?*; do
+    [ -e "$candidate" ] || [ -L "$candidate" ] || continue
+    [ "$candidate" = "$APP_ROOT/user-data" ] || return 1
+  done
+  return 0
 }
 
 is_running_at() {
@@ -264,7 +281,7 @@ prepare_install_root() {
   if [ "$existing_payload" -eq 1 ]; then
     is_running_at "$APP_ROOT" && die 'close ChatGPT before installing or updating it'
   else
-    if directory_has_content; then
+    if directory_has_content && ! directory_has_only_user_data; then
       die "installation directory is not empty: $APP_ROOT"
     fi
   fi
@@ -941,6 +958,7 @@ install_payload() {
 }
 
 load_configured_root() {
+  load_mode=${1-}
   [ -r "$CONFIG_FILE" ] || die 'not configured; run install-codex-app.sh first'
   IFS= read -r APP_ROOT < "$CONFIG_FILE" || true
   [ -n "${APP_ROOT-}" ] || die "installation directory is empty in $CONFIG_FILE"
@@ -948,7 +966,10 @@ load_configured_root() {
     /*) ;;
     *) die "installation directory must be absolute: $APP_ROOT" ;;
   esac
-  [ -x "$APP_ROOT/run-chatgpt" ] || die "launcher not found in $APP_ROOT"
+  if [ "$load_mode" != uninstall ]; then
+    [ -x "$APP_ROOT/run-chatgpt" ] || die "launcher not found in $APP_ROOT"
+  fi
+  [ "$load_mode" = uninstall ] && return 0
   NATIVE_DECORATIONS=$(awk -F= '$1 == "native_decorations" {print $2; exit}' "$CONFIG_FILE")
   NATIVE_DECORATIONS=${NATIVE_DECORATIONS:-0}
   case "$NATIVE_DECORATIONS" in
@@ -976,6 +997,125 @@ load_configured_root() {
           ;;
       esac
     fi
+  fi
+}
+
+validate_uninstall_root() {
+  case "$APP_ROOT" in
+    /|"$HOME"|'') die "refusing to uninstall application root: ${APP_ROOT:-empty}" ;;
+    "$CODEX_DIRECTORY"|"$CONFIG_DIRECTORY") die "refusing to uninstall a user data directory: $APP_ROOT" ;;
+  esac
+  case "$APP_ROOT/" in
+    "$CODEX_DIRECTORY"/*|"$CONFIG_DIRECTORY"/*) die "refusing to uninstall an application inside a user data directory: $APP_ROOT" ;;
+  esac
+  [ -d "$APP_ROOT" ] || die "installation directory does not exist: $APP_ROOT"
+  resolved_root=$(CDPATH= cd -- "$APP_ROOT" && pwd -P) \
+    || die "cannot access installation directory: $APP_ROOT"
+  [ "$resolved_root" = "$APP_ROOT" ] \
+    || die "refusing to uninstall a symbolic-link installation directory: $APP_ROOT"
+}
+
+remove_installation_artifacts() {
+  preserve_app_data=$1
+  rm -rf \
+    "$APP_ROOT/usr" \
+    "$APP_ROOT/etc" \
+    "$APP_ROOT/var" \
+    "$APP_ROOT/external" \
+    "$APP_ROOT/state" \
+    "$APP_ROOT/update-cache"
+  rm -f \
+    "$APP_ROOT/run-chatgpt" \
+    "$APP_ROOT/installer" \
+    "$APP_ROOT/patch-native-decoration.py" \
+    "$APP_ROOT/patch-native-decoration.lock"
+  if [ "$preserve_app_data" -eq 0 ]; then
+    rm -rf "$APP_ROOT/user-data"
+  fi
+  for temporary_path in \
+    "$APP_ROOT"/.install.* \
+    "$APP_ROOT"/.external.* \
+    "$APP_ROOT"/cli.* \
+    "$APP_ROOT"/installer.* \
+    "$APP_ROOT"/run-chatgpt.* \
+    "$APP_ROOT"/patch-native-decoration.py.*; do
+    [ -e "$temporary_path" ] || [ -L "$temporary_path" ] || continue
+    rm -rf "$temporary_path"
+  done
+}
+
+remove_user_launchers() {
+  rm -f "$COMMAND_PATH" "$HOME/.local/bin/$NATIVE_DECORATION_PATCH" "$DESKTOP_FILE"
+  if [ -f "$MIME_APPS_FILE" ] && [ ! -L "$MIME_APPS_FILE" ]; then
+    mime_apps_temporary="$MIME_APPS_FILE.$$"
+    mime_apps_removed=0
+    while IFS= read -r mime_apps_line || [ -n "$mime_apps_line" ]; do
+      case "$mime_apps_line" in
+        'x-scheme-handler/codex=chatgpt-local.desktop'|'x-scheme-handler/codex=chatgpt-local.desktop;')
+          mime_apps_removed=1
+          ;;
+        *) printf '%s\n' "$mime_apps_line" ;;
+      esac
+    done < "$MIME_APPS_FILE" > "$mime_apps_temporary"
+    if [ "$mime_apps_removed" -eq 1 ]; then
+      chmod --reference="$MIME_APPS_FILE" "$mime_apps_temporary" 2>/dev/null || true
+      mv -f "$mime_apps_temporary" "$MIME_APPS_FILE"
+    else
+      rm -f "$mime_apps_temporary"
+    fi
+  fi
+  desktop_directory=$(dirname -- "$DESKTOP_FILE")
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$desktop_directory" >/dev/null 2>&1 || true
+  fi
+}
+
+remove_preserved_data() {
+  rm -rf -- "$APP_ROOT/user-data" "$CODEX_DIRECTORY" "$CONFIG_DIRECTORY"
+}
+
+uninstall_app() {
+  preserve_data=1
+  case "${1-}" in
+    '') ;;
+    --no-preserve-data) preserve_data=0 ;;
+    *) die 'usage: chatgpt uninstall [--no-preserve-data]' ;;
+  esac
+
+  [ "$(id -u)" -ne 0 ] || die 'do not run `chatgpt uninstall` as root'
+  for uninstall_path in \
+    "$HOME" \
+    "$CONFIG_DIRECTORY" \
+    "$MIME_APPS_FILE" \
+    "$DESKTOP_FILE" \
+    "$COMMAND_PATH" \
+    "$CODEX_DIRECTORY"; do
+    case "$uninstall_path" in
+      /*) ;;
+      *) die "uninstall path must be absolute: $uninstall_path" ;;
+    esac
+  done
+  validate_uninstall_root
+  is_running_at "$APP_ROOT" && die 'close ChatGPT before uninstalling it'
+  remove_user_launchers
+  remove_installation_artifacts "$preserve_data"
+  if [ "$preserve_data" -eq 0 ]; then
+    remove_preserved_data
+  fi
+
+  if directory_has_only_user_data; then
+    printf '%s\n' "Uninstalled ChatGPT files from $APP_ROOT; preserved $APP_ROOT/user-data."
+  elif directory_has_content; then
+    printf '%s\n' "Uninstalled ChatGPT files from $APP_ROOT."
+    printf '%s\n' "The installation directory was kept because it contains unrecognized files: $APP_ROOT"
+  else
+    rmdir "$APP_ROOT" 2>/dev/null || true
+    printf '%s\n' "Uninstalled ChatGPT from $APP_ROOT."
+  fi
+  if [ "$preserve_data" -eq 1 ]; then
+    printf '%s\n' 'Preserved ChatGPT profile data, ~/.codex, and ~/.config/chatgpt.'
+  else
+    printf '%s\n' 'Removed ChatGPT profile data, ~/.codex, and the ChatGPT configuration file.'
   fi
 }
 
@@ -1122,7 +1262,10 @@ run_chatgpt() {
         ;;
     esac
   fi
-  load_configured_root
+  case "${1-}" in
+    uninstall) load_configured_root uninstall ;;
+    *) load_configured_root ;;
+  esac
   export CHATGPT_PATCHES=$PATCHES
   export CHATGPT_APP_ROOT=$APP_ROOT
   case "${1-}" in
@@ -1146,6 +1289,10 @@ run_chatgpt() {
     check-update)
       [ "$#" -le 2 ] || die 'usage: chatgpt check-update [manual|startup]'
       check_update_app "${2-manual}"
+      ;;
+    uninstall)
+      [ "$#" -le 2 ] || die 'usage: chatgpt uninstall [--no-preserve-data]'
+      uninstall_app "${2-}"
       ;;
     download-update)
       [ "$#" -le 2 ] || die 'usage: chatgpt download-update [ETAG]'

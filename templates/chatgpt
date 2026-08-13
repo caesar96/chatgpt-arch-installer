@@ -15,7 +15,7 @@ fi
 if [ "${1-}" = --help ] || [ "${1-}" = -h ]; then
   exec "$APP_ROOT/installer" --help
 fi
-if [ "${1-}" = update ] || [ "${1-}" = patches ] || [ "${1-}" = check-update ] || [ "${1-}" = download-update ] || [ "${1-}" = install-package ] || [ "${1-}" = --native-window-decoration ] || [ "${1-}" = --no-native-window-decoration ]; then
+if [ "${1-}" = update ] || [ "${1-}" = uninstall ] || [ "${1-}" = patches ] || [ "${1-}" = check-update ] || [ "${1-}" = download-update ] || [ "${1-}" = install-package ] || [ "${1-}" = --native-window-decoration ] || [ "${1-}" = --no-native-window-decoration ]; then
   exec "$APP_ROOT/installer" "$@"
 fi
 if [ "${CHATGPT_NO_PATCHES-0}" != 1 ] && [ -n "$PATCHES" ]; then
