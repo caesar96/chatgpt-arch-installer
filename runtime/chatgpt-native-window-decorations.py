@@ -13,11 +13,16 @@ import tempfile
 from pathlib import Path
 
 
-APP_ROOT = Path(__file__).resolve().parent.parent
+APP_ROOT = Path(
+    os.environ.get("CHATGPT_PATCH_APP_ROOT", str(Path(__file__).resolve().parent.parent))
+).resolve()
 ARCHIVE = APP_ROOT / "usr/lib/chatgpt/resources/app.asar"
 EXECUTABLE = APP_ROOT / "usr/lib/chatgpt/ChatGPT"
 VERSION_FILE = APP_ROOT / "usr/lib/chatgpt/version"
 LOCK_FILE = APP_ROOT / "state" / "native-window-decorations.lock"
+BACKUP_DIRECTORY = Path(
+    os.environ.get("CHATGPT_PATCH_BACKUP_DIRECTORY", str(ARCHIVE.parent))
+).resolve()
 
 
 def same_size(source: bytes, replacement: bytes) -> bytes:
@@ -115,7 +120,7 @@ def backup_path(before_hash: str) -> Path:
         character if character.isalnum() or character in ".-_" else "_"
         for character in app_version()
     )
-    return ARCHIVE.with_name(
+    return BACKUP_DIRECTORY / (
         f"{ARCHIVE.name}.native-decoration.{version}.{before_hash[:12]}.bak"
     )
 
@@ -163,6 +168,7 @@ def apply_patch(data: bytes, quiet: bool) -> int:
 
     backup = backup_path(before_hash)
     if not backup.exists():
+        backup.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ARCHIVE, backup)
     atomic_write(patched_data)
     print(f"Applied native decoration patch to ChatGPT {app_version()}.")

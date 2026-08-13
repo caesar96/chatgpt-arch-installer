@@ -650,10 +650,16 @@ download_update_package() {
   mv -f "$package_temporary" "$package_cached" \
     || die 'could not save the downloaded update'
   package_temporary=
+  printf '%s\n' 'Preparing the update before closing ChatGPT...'
+  stage_update_package "$package_cached" \
+    || die 'could not prepare the downloaded update'
+  emit_patch_report "$STAGED_ROOT/payload/patch-report"
   printf '%s\n' 'status=ready' \
     "installed-version=${INSTALLED_PACKAGE_VERSION:-unknown}" \
     "available-version=$package_version" \
-    "package-path=$package_cached"
+    "package-path=$package_cached" \
+    "staging-path=$STAGED_ROOT" \
+    "runtime-version=$(awk 'NR == 1 {print; exit}' "$STAGED_ROOT/payload/usr/lib/chatgpt/version")"
 }
 
 extract_data() {
@@ -831,6 +837,137 @@ apply_native_decoration_patch() {
   printf '%s\n' 'Native system window decorations enabled.'
 }
 
+apply_native_decoration_patch_to_root() {
+  target_root=$1
+  patch_script="$APP_ROOT/runtime/$NATIVE_DECORATION_PATCH"
+  [ -r "$patch_script" ] || patch_script="$SOURCE_DIRECTORY/runtime/$NATIVE_DECORATION_PATCH"
+  [ -r "$patch_script" ] || return 1
+  [ "$NATIVE_DECORATIONS" -eq 1 ] || return 0
+  if [ "$target_root" = "$APP_ROOT" ]; then
+    python3 "$patch_script" --apply
+  else
+    CHATGPT_PATCH_APP_ROOT="$target_root" \
+      CHATGPT_PATCH_BACKUP_DIRECTORY="$APP_ROOT/update-cache" \
+      python3 "$patch_script" --apply
+  fi
+}
+
+patch_manifest_path() {
+  patch_id=$1
+  if [ -r "$SOURCE_DIRECTORY/patches/$patch_id/manifest.json" ]; then
+    printf '%s\n' "$SOURCE_DIRECTORY/patches/$patch_id/manifest.json"
+  elif [ -r "$APP_ROOT/patches/$patch_id/manifest.json" ]; then
+    printf '%s\n' "$APP_ROOT/patches/$patch_id/manifest.json"
+  else
+    return 1
+  fi
+}
+
+manifest_supports_version() {
+  manifest_file=$1
+  manifest_key=$2
+  candidate_version=$3
+  manifest_versions=$(sed -n "/\"$manifest_key\"[[:space:]]*:/,/]/p" "$manifest_file")
+  [ -z "$manifest_versions" ] || printf '%s\n' "$manifest_versions" | awk -v version="$candidate_version" '
+    index($0, "\"" version "\"") { found=1 }
+    END { exit !found }
+  '
+}
+
+record_patch_report() {
+  report_file=$1
+  report_id=$2
+  report_name=$3
+  report_status=$4
+  report_detail=$5
+  report_detail=$(printf '%s' "$report_detail" | tr '\n|' '  ')
+  printf '%s|%s|%s|%s\n' \
+    "$report_id" "$report_name" "$report_status" "$report_detail" >> "$report_file"
+}
+
+check_candidate_patch_compatibility() {
+  prepared_root=$1
+  report_file=$prepared_root/patch-report
+  candidate_version=$(awk 'NR == 1 {print; exit}' "$prepared_root/usr/lib/chatgpt/version" 2>/dev/null || true)
+  : > "$report_file"
+  PREPARED_NATIVE_PATCHED=0
+  PREPARED_HAS_INCOMPATIBLE_PATCH=0
+
+  for patch_id in $(printf '%s' "$PATCHES" | tr ',' ' '); do
+    [ -n "$patch_id" ] || continue
+    manifest_file=$(patch_manifest_path "$patch_id" 2>/dev/null || true)
+    if [ -z "$manifest_file" ]; then
+      record_patch_report "$report_file" "$patch_id" "$patch_id" incompatible 'patch manifest is missing'
+      PREPARED_HAS_INCOMPATIBLE_PATCH=1
+      continue
+    fi
+    patch_name=$(awk -F'"' '/"name"[[:space:]]*:/ {print $4; exit}' "$manifest_file")
+    patch_name=${patch_name:-$patch_id}
+    manifest_id=$(awk -F'"' '/"id"[[:space:]]*:/ {print $4; exit}' "$manifest_file")
+    if [ "$manifest_id" != "$patch_id" ]; then
+      record_patch_report "$report_file" "$patch_id" "$patch_name" incompatible 'patch manifest id does not match its directory'
+      PREPARED_HAS_INCOMPATIBLE_PATCH=1
+      continue
+    fi
+    if ! manifest_supports_version "$manifest_file" applicationVersions "$candidate_version"; then
+      record_patch_report "$report_file" "$patch_id" "$patch_name" incompatible "unsupported ChatGPT runtime $candidate_version"
+      PREPARED_HAS_INCOMPATIBLE_PATCH=1
+      continue
+    fi
+    if ! manifest_supports_version "$manifest_file" electronVersions "$candidate_version"; then
+      record_patch_report "$report_file" "$patch_id" "$patch_name" incompatible "unsupported Electron runtime $candidate_version"
+      PREPARED_HAS_INCOMPATIBLE_PATCH=1
+      continue
+    fi
+
+    if [ "$patch_id" = native-window-decorations ] && [ "$NATIVE_DECORATIONS" -eq 1 ]; then
+      native_patch_output=
+      native_patch_status=0
+      native_patch_output=$(apply_native_decoration_patch_to_root "$prepared_root" 2>&1) || native_patch_status=$?
+      if [ "$native_patch_status" -ne 0 ]; then
+        native_patch_reason=$(printf '%s\n' "$native_patch_output" | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g')
+        record_patch_report "$report_file" "$patch_id" "$patch_name" incompatible "native ASAR patch failed: ${native_patch_reason:-unknown error}"
+        PREPARED_HAS_INCOMPATIBLE_PATCH=1
+        continue
+      fi
+      PREPARED_NATIVE_PATCHED=1
+    fi
+    record_patch_report "$report_file" "$patch_id" "$patch_name" compatible "supported by ChatGPT runtime $candidate_version"
+  done
+
+  if [ "$PREPARED_HAS_INCOMPATIBLE_PATCH" -eq 1 ] && [ "${PREPARE_ALLOW_INCOMPATIBLE-0}" != 1 ]; then
+    first_incompatible=$(awk -F'|' '$3 == "incompatible" {print $4; exit}' "$report_file")
+    die "the downloaded package is incompatible with an enabled patch: ${first_incompatible:-unknown reason}"
+  fi
+}
+
+emit_patch_report() {
+  report_file=$1
+  report_index=0
+  [ -r "$report_file" ] || return 0
+  while IFS='|' read -r report_id report_name report_status report_detail; do
+    [ -n "$report_id" ] || continue
+    report_index=$((report_index + 1))
+    printf 'patch-report-%s=%s|%s|%s|%s\n' \
+      "$report_index" "$report_id" "$report_name" "$report_status" "$report_detail"
+  done < "$report_file"
+}
+
+disable_patch() {
+  disabled_patch=$1
+  PATCHES=$(printf '%s' ",${PATCHES-}," | awk -v p=",$disabled_patch," '{gsub(p,","); gsub(/^,|,$/,""); gsub(/,,+/,","); print}')
+}
+
+disable_incompatible_staged_patches() {
+  report_file=$1
+  while IFS='|' read -r report_id report_name report_status report_detail; do
+    [ "$report_status" = incompatible ] || continue
+    disable_patch "$report_id"
+    [ "$report_id" = native-window-decorations ] || continue
+    NATIVE_DECORATIONS=0
+  done < "$report_file"
+}
+
 write_config() {
   config_directory=$(dirname -- "$CONFIG_FILE")
   mkdir -p "$config_directory"
@@ -893,11 +1030,10 @@ report_command_path() {
   esac
 }
 
-install_payload() {
-  supplied_package=${1-}
+install_prepared_payload() {
+  prepared_root=$1
   temporary_root=$(mktemp -d "$APP_ROOT/.install.XXXXXXXX") \
     || die "cannot create a temporary directory inside $APP_ROOT"
-  EXTRACTED_PATH="$temporary_root/extracted"
   backup_usr="$temporary_root/original-usr"
   backup_etc="$temporary_root/original-etc"
   backup_var="$temporary_root/original-var"
@@ -970,35 +1106,18 @@ install_payload() {
   }
   trap cleanup EXIT INT TERM
 
-  if [ -n "$supplied_package" ]; then
-    PACKAGE_PATH=$supplied_package
-    [ -r "$PACKAGE_PATH" ] || die "package file is not readable: $PACKAGE_PATH"
-  else
-    PACKAGE_PATH="$temporary_root/$PACKAGE_NAME"
-    printf '%s\n' 'Downloading latest ChatGPT package...'
-    download_latest_package "$PACKAGE_PATH" || die 'download failed'
-  fi
-
-  read_package_metadata "$PACKAGE_PATH"
-  INSTALLED_PACKAGE_VERSION=$package_version
-  printf 'Package: %s %s\n' "$package_name" "$package_version"
-
-  mkdir "$EXTRACTED_PATH"
-  extract_data || die 'could not extract the package'
-  make_runtime_executables "$EXTRACTED_PATH"
-  check_runtime_dependencies_at "$EXTRACTED_PATH" \
-    || die 'the downloaded package cannot run with the current host libraries'
-  [ -x "$EXTRACTED_PATH/usr/lib/chatgpt/ChatGPT" ] \
-    || die 'downloaded package does not contain the ChatGPT executable'
-  [ -f "$EXTRACTED_PATH/usr/share/pixmaps/chatgpt.png" ] \
-    || die 'downloaded package does not contain the application icon'
+  [ -d "$prepared_root" ] || die "prepared payload is missing: $prepared_root"
+  [ -x "$prepared_root/usr/lib/chatgpt/ChatGPT" ] \
+    || die 'prepared payload does not contain the ChatGPT executable'
+  [ -f "$prepared_root/usr/share/pixmaps/chatgpt.png" ] \
+    || die 'prepared payload does not contain the application icon'
 
   if [ -e "$APP_ROOT/usr" ]; then
     mv "$APP_ROOT/usr" "$backup_usr" \
       || die 'could not prepare the current installation for replacement'
   fi
   payload_replaced=1
-  mv "$EXTRACTED_PATH/usr" "$APP_ROOT/usr" \
+  mv "$prepared_root/usr" "$APP_ROOT/usr" \
     || die 'could not install the downloaded application files'
   if [ -e "$APP_ROOT/etc" ]; then
     mv "$APP_ROOT/etc" "$backup_etc" \
@@ -1010,14 +1129,14 @@ install_payload() {
       || die 'could not prepare the current var files for replacement'
     var_backup_created=1
   fi
-  if [ -e "$EXTRACTED_PATH/etc" ]; then
+  if [ -e "$prepared_root/etc" ]; then
     etc_payload_created=1
-    cp -a "$EXTRACTED_PATH/etc" "$APP_ROOT/etc" \
+    cp -a "$prepared_root/etc" "$APP_ROOT/etc" \
       || die 'could not install the downloaded etc files'
   fi
-  if [ -e "$EXTRACTED_PATH/var" ]; then
+  if [ -e "$prepared_root/var" ]; then
     var_payload_created=1
-    cp -a "$EXTRACTED_PATH/var" "$APP_ROOT/var" \
+    cp -a "$prepared_root/var" "$APP_ROOT/var" \
       || die 'could not install the downloaded var files'
   fi
   copy_support_files
@@ -1025,13 +1144,111 @@ install_payload() {
   launcher_temporary="$temporary_root/chatgpt-launcher"
   write_run_launcher "$launcher_temporary"
   mv -f "$launcher_temporary" "$APP_ROOT/bin/chatgpt-launcher"
-  if [ "$NATIVE_DECORATIONS" -eq 1 ]; then
+  if [ "$NATIVE_DECORATIONS" -eq 1 ] && [ "${PREPARED_NATIVE_PATCHED-0}" -ne 1 ]; then
     if ! write_native_decoration_patch || ! apply_native_decoration_patch; then
       rollback_payload
       die 'could not apply the native window decoration patch; the previous payload was restored'
     fi
   fi
   printf 'Application payload installed in %s.\n' "$APP_ROOT"
+}
+
+prepare_package_payload() {
+  package_path=$1
+  prepared_root=$2
+  PACKAGE_PATH=$package_path
+  [ -r "$PACKAGE_PATH" ] || die "package file is not readable: $PACKAGE_PATH"
+  read_package_metadata "$PACKAGE_PATH"
+  printf 'Package: %s %s\n' "$package_name" "$package_version"
+  mkdir -p "$prepared_root"
+  EXTRACTED_PATH="$prepared_root/payload"
+  mkdir "$EXTRACTED_PATH"
+  extract_data || die 'could not extract the package'
+  make_runtime_executables "$EXTRACTED_PATH"
+  check_runtime_dependencies_at "$EXTRACTED_PATH" \
+    || die 'the downloaded package cannot run with the current host libraries'
+  [ -x "$EXTRACTED_PATH/usr/lib/chatgpt/ChatGPT" ] \
+    || die 'downloaded package does not contain the ChatGPT executable'
+  [ -f "$EXTRACTED_PATH/usr/share/pixmaps/chatgpt.png" ] \
+    || die 'downloaded package does not contain the application icon'
+  PREPARE_ALLOW_INCOMPATIBLE=${PREPARE_ALLOW_INCOMPATIBLE:-0}
+  check_candidate_patch_compatibility "$EXTRACTED_PATH"
+  PREPARED_PACKAGE_VERSION=$package_version
+}
+
+install_payload() {
+  supplied_package=${1-}
+  preparation_root=$(mktemp -d "$APP_ROOT/.install.XXXXXXXX") \
+    || die "cannot create a temporary directory inside $APP_ROOT"
+  if [ -n "$supplied_package" ]; then
+    package_path=$supplied_package
+  else
+    package_path="$preparation_root/$PACKAGE_NAME"
+    printf '%s\n' 'Downloading latest ChatGPT package...'
+    download_latest_package "$package_path" || die 'download failed'
+  fi
+  PREPARE_ALLOW_INCOMPATIBLE=0
+  prepare_package_payload "$package_path" "$preparation_root"
+  INSTALLED_PACKAGE_VERSION=$PREPARED_PACKAGE_VERSION
+  install_prepared_payload "$preparation_root/payload"
+  rm -rf "$preparation_root"
+}
+
+stage_update_package() {
+  package_path=$1
+  staging_root=$(mktemp -d "$APP_ROOT/update-cache/staging.XXXXXXXX") \
+    || die "cannot create update staging directory inside $APP_ROOT"
+  PREPARE_ALLOW_INCOMPATIBLE=1
+  if ( \
+    prepare_package_payload "$package_path" "$staging_root" && \
+    printf '%s\n' \
+      "package-version=$PREPARED_PACKAGE_VERSION" \
+      "native-decorations=$NATIVE_DECORATIONS" \
+      "patches=$PATCHES" > "$staging_root/metadata" \
+  ); then
+    PREPARE_ALLOW_INCOMPATIBLE=0
+    STAGED_ROOT=$staging_root
+    return 0
+  fi
+  PREPARE_ALLOW_INCOMPATIBLE=0
+  rm -rf "$staging_root"
+  return 1
+}
+
+install_staged_app() {
+  staging_root=$1
+  allow_incompatible=${2-}
+  check_architecture
+  require_host_tools || exit 1
+  check_desktop_helpers || exit 1
+  [ -d "$staging_root" ] || die "update staging directory is missing: $staging_root"
+  case "$staging_root" in
+    "$APP_ROOT/update-cache/"*) ;;
+    *) die "refusing to install a staging directory outside the update cache: $staging_root" ;;
+  esac
+  [ -r "$staging_root/metadata" ] || die 'update staging metadata is missing'
+  staged_report_file=$staging_root/payload/patch-report
+  [ -r "$staged_report_file" ] || die 'update staging patch report is missing'
+  staged_package_version=$(awk -F= '$1 == "package-version" {print $2; exit}' "$staging_root/metadata")
+  staged_native_decorations=$(awk -F= '$1 == "native-decorations" {print $2; exit}' "$staging_root/metadata")
+  [ -n "$staged_package_version" ] || die 'update staging metadata has no package version'
+  [ "$staged_native_decorations" = "$NATIVE_DECORATIONS" ] \
+    || die 'the staged update was prepared with different native decoration settings'
+  if [ "$allow_incompatible" = --allow-incompatible-patches ]; then
+    disable_incompatible_staged_patches "$staged_report_file"
+  elif awk -F'|' '$3 == "incompatible" {found=1} END {exit !found}' "$staged_report_file" 2>/dev/null; then
+    die 'the staged update contains incompatible enabled patches; confirm installation without them'
+  fi
+  PREPARED_NATIVE_PATCHED=0
+  if [ "$NATIVE_DECORATIONS" -eq 1 ] \
+    && awk -F'|' '$1 == "native-window-decorations" && $3 == "compatible" {found=1} END {exit !found}' "$staged_report_file" 2>/dev/null; then
+    PREPARED_NATIVE_PATCHED=1
+  fi
+  version_is_newer "$staged_package_version" "$INSTALLED_PACKAGE_VERSION" \
+    || die 'the staged update is not newer than the installed package'
+  [ -d "$staging_root/payload" ] || die 'staged update payload is missing'
+  INSTALLED_PACKAGE_VERSION=$staged_package_version
+  install_prepared_payload "$staging_root/payload"
 }
 
 load_configured_root() {
@@ -1395,6 +1612,14 @@ chatgpt_cli_main() {
     install-package)
       [ "$#" -eq 2 ] || die 'usage: chatgpt install-package PACKAGE'
       install_package_app "$2"
+      ;;
+    install-staged)
+      [ "$#" -ge 2 ] && [ "$#" -le 3 ] \
+        || die 'usage: chatgpt install-staged STAGING_DIRECTORY [--allow-incompatible-patches]'
+      install_staged_app "$2" "${3-}"
+      finish_install
+      payload_install_succeeded=1
+      rm -rf "$2" "$APP_ROOT/update-cache/$PACKAGE_NAME"
       ;;
     patches)
       [ "$NO_PATCHES" -eq 0 ] || die '--no-patches cannot be used with patch management'

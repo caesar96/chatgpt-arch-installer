@@ -5,7 +5,8 @@ APP_ROOT=$1
 PARENT_PID=$2
 CLI_PATH=${3-}
 CLI_PATH=${CLI_PATH:-$APP_ROOT/bin/chatgpt}
-PACKAGE_PATH=${4-}
+UPDATE_SOURCE=${4-}
+PACKAGE_PATH=${5-}
 
 parent_is_running() {
   [ -r "/proc/$PARENT_PID/stat" ] || return 1
@@ -46,6 +47,11 @@ state_directory=$APP_ROOT/state
 mkdir -p "$state_directory" 2>/dev/null || true
 update_log=$state_directory/update-from-menu.log
 temporary_log=$update_log.$$
+
+printf '%s\n' \
+  "Updater started (pid=$$ parent=$PARENT_PID source=${UPDATE_SOURCE:-none})." \
+  "Started at $(date '+%Y-%m-%dT%H:%M:%S%z')." > "$update_log" 2>/dev/null || true
+printf '%s\n' 'running' > "$state_directory/update-from-menu.status" 2>/dev/null || true
 
 relaunch_app() {
   if [ -x "$APP_ROOT/bin/chatgpt-launcher" ]; then
@@ -96,7 +102,24 @@ if ! wait_for_app_exit; then
   record_failure 1 'ChatGPT could not be closed cleanly before the update started.'
 fi
 
-if [ -n "$PACKAGE_PATH" ]; then
+if [ -n "$UPDATE_SOURCE" ]; then
+  if [ -d "$UPDATE_SOURCE/payload" ]; then
+    if "$APP_ROOT/bin/chatgpt" install-staged "$UPDATE_SOURCE" >"$temporary_log" 2>&1; then
+      update_status=0
+    else
+      update_status=$?
+    fi
+  elif [ -r "$UPDATE_SOURCE" ]; then
+    if "$APP_ROOT/bin/chatgpt" install-package "$UPDATE_SOURCE" >"$temporary_log" 2>&1; then
+      update_status=0
+    else
+      update_status=$?
+    fi
+  else
+    printf '%s\n' "Update source is missing: $UPDATE_SOURCE" > "$temporary_log" 2>&1 || true
+    update_status=1
+  fi
+elif [ -n "$PACKAGE_PATH" ]; then
   if "$APP_ROOT/bin/chatgpt" install-package "$PACKAGE_PATH" >"$temporary_log" 2>&1; then
     update_status=0
   else
@@ -111,7 +134,11 @@ else
 fi
 
 if [ "$update_status" -eq 0 ]; then
-  [ -z "$PACKAGE_PATH" ] || rm -f "$PACKAGE_PATH"
+  for update_artifact in "$UPDATE_SOURCE" "$PACKAGE_PATH"; do
+    case "$update_artifact" in
+      "$APP_ROOT/update-cache/"*) rm -rf "$update_artifact" ;;
+    esac
+  done
   mv -f "$temporary_log" "$update_log" 2>/dev/null || true
   printf '%s\n' 'success' > "$state_directory/update-from-menu.status" 2>/dev/null || true
   if relaunch_app; then

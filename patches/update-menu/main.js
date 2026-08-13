@@ -18,6 +18,26 @@ function diagnostic(message) {
   }
 }
 
+function commandOnPath(command) {
+  if (path.isAbsolute(command)) {
+    try {
+      fs.accessSync(command, fs.constants.X_OK);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+  return (process.env.PATH || '').split(path.delimiter).some((directory) => {
+    if (!directory) return false;
+    try {
+      fs.accessSync(path.join(directory, command), fs.constants.X_OK);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  });
+}
+
 function findSubmenu(menu, id, labels) {
   if (!menu || !Array.isArray(menu.items)) return null;
   const identified = id && menu.getMenuItemById?.(id);
@@ -39,6 +59,33 @@ function parseCheckResult(output) {
     }
   }
   return result;
+}
+
+function parsePatchReports(result) {
+  return Object.keys(result)
+    .filter((key) => key.startsWith('patch-report-'))
+    .sort((left, right) => Number(left.slice(13)) - Number(right.slice(13)))
+    .map((key) => {
+      const [id, name, status, ...detailParts] = result[key].split('|');
+      return {
+        id,
+        name: name || id,
+        status,
+        detail: detailParts.join('|') || (status === 'compatible' ? 'Compatible with this version.' : 'Compatibility could not be verified.'),
+      };
+    });
+}
+
+function formatPatchReports(reports) {
+  if (!reports.length) return 'No enabled external patches were found.';
+  return reports.map((report) => {
+    const marker = report.status === 'compatible' ? '✓' : '✗';
+    return `${marker} ${report.name}: ${report.status === 'compatible' ? 'compatible' : report.detail}`;
+  }).join('\n');
+}
+
+function hasIncompatiblePatch(reports) {
+  return reports.some((report) => report.status !== 'compatible');
 }
 
 function getParentWindow(context) {
@@ -105,14 +152,17 @@ function updateDialogHtml(context, options) {
   const updateAvailable = options.updateAvailable === true;
   const message = escapeHtml(options.message);
   const detail = escapeHtml(options.detail).replaceAll('\n', '<br>');
+  const dialogActions = Array.isArray(options.actions)
+    ? options.actions
+    : updateAvailable
+      ? [{ id: 'update', label: 'Update Now', primary: true }, { id: 'later', label: 'Later' }]
+      : [{ id: 'later', label: 'OK', primary: true }];
   const icon = checking || downloading
     ? '<div class="spinner" aria-hidden="true"></div>'
     : `<div class="status-mark ${options.type === 'error' ? 'error' : ''}" aria-hidden="true">${options.type === 'error' ? '!' : 'i'}</div>`;
   const buttons = checking || downloading
     ? ''
-    : updateAvailable
-      ? '<button class="button primary" data-action="update">Update Now</button><button class="button secondary" data-action="later">Later</button>'
-      : '<button class="button primary" data-action="later">OK</button>';
+    : dialogActions.map((action) => `<button class="button ${action.primary ? 'primary' : 'secondary'}" data-action="${escapeHtml(action.id)}">${escapeHtml(action.label)}</button>`).join('');
 
   return `<!doctype html>
 <html><head><meta charset="utf-8"><style>
@@ -127,10 +177,10 @@ function updateDialogHtml(context, options) {
     --accent-text: ${theme.accentText};
   }
   * { box-sizing: border-box; }
-  html, body { margin: 0; min-height: 100%; }
+  html, body { height: 100%; margin: 0; min-height: 0; overflow: hidden; }
   body { background: var(--surface); color: var(--text); font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-  .window { background: var(--surface); display: flex; flex-direction: column; min-height: 100vh; overflow: hidden; }
-  .content { align-items: center; display: flex; flex: 1; flex-direction: column; justify-content: center; padding: 8px 28px 22px; text-align: center; }
+  .window { background: var(--surface); display: flex; flex-direction: column; height: 100vh; min-height: 0; overflow: hidden; }
+  .content { align-items: center; display: flex; flex: 1 1 auto; flex-direction: column; justify-content: center; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 18px 28px 22px; text-align: center; }
   .status-mark { align-items: center; background: var(--accent); border-radius: 50%; color: var(--accent-text); display: flex; font-size: 15px; font-weight: 700; height: 28px; justify-content: center; margin-bottom: 13px; width: 28px; }
   .status-mark.error { background: #d93025; color: #ffffff; }
   .spinner { animation: spin 1s linear infinite; border: 3px solid var(--border); border-radius: 50%; border-top-color: var(--accent); height: 26px; margin: 0 auto 15px; width: 26px; }
@@ -138,7 +188,7 @@ function updateDialogHtml(context, options) {
   .progress-value { background: var(--accent); height: 100%; transition: width .15s ease; width: ${Math.max(0, Math.min(100, Number(options.progress) || 0))}%; }
   h1 { font-size: 17px; line-height: 1.3; margin: 0 0 10px; }
   p { color: var(--muted); line-height: 1.45; margin: 0; max-width: 410px; }
-  .actions { background: var(--surface-raised); border-top: 1px solid var(--border); display: flex; gap: 10px; justify-content: flex-end; padding: 12px 14px; }
+  .actions { background: var(--surface-raised); border-top: 1px solid var(--border); display: flex; flex: 0 0 auto; gap: 10px; justify-content: flex-end; padding: 12px 14px; }
   .button { border: 1px solid var(--border); border-radius: 6px; cursor: pointer; font: inherit; font-weight: 600; min-width: 112px; padding: 8px 16px; }
   .button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
   .button.secondary { background: transparent; color: var(--text); }
@@ -166,7 +216,7 @@ function createUpdateWindow(context, parentWindow, options) {
   const checking = options.checking === true;
   const downloading = options.downloading === true;
   const width = checking ? 380 : 500;
-  const height = checking ? 170 : downloading ? 250 : 285;
+  const height = checking ? 170 : downloading ? 250 : options.actions?.length > 2 ? 390 : 285;
   const theme = getUpdateTheme(context);
   let updateWindow = null;
   let settled = false;
@@ -207,11 +257,15 @@ function createUpdateWindow(context, parentWindow, options) {
     updateWindow.webContents.on('will-navigate', (event, url) => {
       if (!url.startsWith('chatgpt-update-dialog:')) return;
       event.preventDefault();
-      closeWithResponse(url.endsWith(':update') ? 0 : 1);
+      const action = decodeURIComponent(url.slice('chatgpt-update-dialog:'.length));
+      const response = (options.actions || []).findIndex((item) => item.id === action);
+      closeWithResponse(response >= 0 ? response : action === 'update' ? 0 : 1);
     });
     updateWindow.webContents.setWindowOpenHandler?.(({ url }) => {
       if (url.startsWith('chatgpt-update-dialog:')) {
-        closeWithResponse(url.endsWith(':update') ? 0 : 1);
+        const action = decodeURIComponent(url.slice('chatgpt-update-dialog:'.length));
+        const response = (options.actions || []).findIndex((item) => item.id === action);
+        closeWithResponse(response >= 0 ? response : action === 'update' ? 0 : 1);
       }
       return { action: 'deny' };
     });
@@ -263,21 +317,23 @@ function openDownloadWindow(context, parentWindow, version) {
     downloading: true,
     progress: 0,
     message: `Downloading ChatGPT ${version}...`,
-    detail: 'The update will be installed after the download reaches 100%.',
+    detail: 'The package will be extracted, validated and installed before this reaches 100%.',
     type: 'info',
   });
   if (!customWindow) return null;
   customWindow.progress = 0;
+  customWindow.message = '0% downloaded';
   customWindow.window?.webContents.once?.('did-finish-load', () => {
     applyDownloadProgress(customWindow, customWindow.progress);
   });
   return customWindow;
 }
 
-function updateDownloadWindow(downloadWindow, progress) {
+function updateDownloadWindow(downloadWindow, progress, message) {
   const safeProgress = Math.max(0, Math.min(100, Number(progress) || 0));
   if (!downloadWindow) return;
   downloadWindow.progress = safeProgress;
+  if (message) downloadWindow.message = message;
   if (!downloadWindow.window || downloadWindow.window.isDestroyed?.()) return;
   if (!downloadWindow.window.webContents.isLoading?.()) {
     applyDownloadProgress(downloadWindow, safeProgress);
@@ -289,7 +345,7 @@ function applyDownloadProgress(downloadWindow, safeProgress) {
   const scriptResult = downloadWindow.window.webContents.executeJavaScript?.(
     `document.querySelector('.progress-value')?.style.setProperty('width', '${safeProgress}%');` +
     `document.querySelector('.progress')?.setAttribute('aria-valuenow', '${safeProgress}');` +
-    `document.querySelector('p').textContent = ${JSON.stringify(`${safeProgress}% downloaded`)};`,
+    `document.querySelector('p').textContent = ${JSON.stringify(downloadWindow.message || `${safeProgress}% downloaded`)};`,
     true,
   );
   scriptResult?.catch?.(() => {});
@@ -303,6 +359,91 @@ function closeDownloadWindow(downloadWindow) {
 function closeCheckingWindow(checkingWindow) {
   if (!checkingWindow || checkingWindow.isDestroyed()) return;
   checkingWindow.destroy();
+}
+
+function restartApp(context) {
+  const launcher = path.join(context.appRoot, 'bin', 'chatgpt-launcher');
+  const app = context.electron.app;
+  try {
+    if (typeof app.relaunch === 'function') {
+      diagnostic(`update-menu: relaunching through ${launcher}`);
+      app.relaunch({ execPath: launcher, args: process.argv.slice(1) });
+      app.quit();
+      return;
+    }
+  } catch (error) {
+    diagnostic(`update-menu: app.relaunch failed: ${error.message}`);
+  }
+  diagnostic('update-menu: Electron relaunch is unavailable; closing without automatic restart');
+  app.quit();
+}
+
+function installStagedUpdate(context, parentWindow, downloadWindow, result, reports, allowIncompatible) {
+  const cliPath = path.join(context.appRoot, 'bin', 'chatgpt');
+  const stagingPath = result['staging-path'];
+  if (!stagingPath) {
+    closeDownloadWindow(downloadWindow);
+    showUpdateDialog(context, parentWindow, {
+      type: 'error',
+      title: 'ChatGPT Updates',
+      message: 'The update was downloaded but could not be staged.',
+      detail: 'The application was not changed.',
+      buttons: ['OK'],
+    }).catch(() => {});
+    return;
+  }
+
+  updateDownloadWindow(downloadWindow, 85, 'Installing the update...');
+  const childArguments = ['install-staged', stagingPath];
+  if (allowIncompatible) childArguments.push('--allow-incompatible-patches');
+  const child = spawn(cliPath, childArguments, {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: process.env,
+  });
+  let output = '';
+  let errorOutput = '';
+  let completed = false;
+  const finish = (error, exitCode) => {
+    if (completed) return;
+    completed = true;
+    context.updateDownloadStarted = false;
+    if (error || exitCode !== 0) {
+      closeDownloadWindow(downloadWindow);
+      const detail = error?.message || errorOutput.trim() || output.trim() || `The staged installation exited with code ${exitCode}.`;
+      showUpdateDialog(context, parentWindow, {
+        type: 'error',
+        title: 'ChatGPT Updates',
+        message: 'Could not install the update.',
+        detail: `${detail}\n\nThe current installation was preserved.`,
+        buttons: ['OK'],
+      }).catch(() => {});
+      return;
+    }
+    context.externalActionStarted = true;
+    updateDownloadWindow(downloadWindow, 100, 'Update installed.');
+    setTimeout(() => {
+      closeDownloadWindow(downloadWindow);
+      showUpdateDialog(context, parentWindow, {
+        type: 'info',
+        title: 'ChatGPT Updates',
+        message: `ChatGPT ${result['available-version'] || result['package-version'] || 'update'} was installed.`,
+        detail: `Installed version: ${result['available-version'] || 'unknown'}\n\nPatch status:\n${formatPatchReports(reports)}\n\nRestart ChatGPT now to use the new version.`,
+        actions: [
+          { id: 'restart', label: 'Restart Now', primary: true },
+          { id: 'later', label: 'Later' },
+        ],
+        buttons: ['Restart Now', 'Later'],
+        cancelId: 1,
+        defaultId: 0,
+      }).then(({ response }) => {
+        if (response === 0) restartApp(context);
+      }).catch(() => {});
+    }, 250);
+  };
+  child.stdout.on('data', (chunk) => { output += chunk.toString(); });
+  child.stderr.on('data', (chunk) => { errorOutput += chunk.toString(); });
+  child.once('error', (error) => finish(error, 1));
+  child.once('close', (exitCode) => finish(null, exitCode));
 }
 
 function checkForUpdates(context, mode = 'manual') {
@@ -446,7 +587,8 @@ function downloadAndInstallUpdate(context, parentWindow, version, etag) {
       }).catch(() => {});
       return;
     }
-    if (result.status !== 'ready' || !result['package-path']) {
+    const updateSource = result['staging-path'] || result['package-path'];
+    if (result.status !== 'ready' || !updateSource) {
       closeDownloadWindow(downloadWindow);
       showUpdateDialog(context, parentWindow, {
         type: 'error',
@@ -457,11 +599,31 @@ function downloadAndInstallUpdate(context, parentWindow, version, etag) {
       }).catch(() => {});
       return;
     }
-    updateDownloadWindow(downloadWindow, 100);
-    setTimeout(() => {
+    const reports = parsePatchReports(result);
+    const continueInstallation = (allowIncompatible) => {
+      installStagedUpdate(context, parentWindow, downloadWindow, result, reports, allowIncompatible);
+    };
+    if (hasIncompatiblePatch(reports)) {
       closeDownloadWindow(downloadWindow);
-      spawnAfterQuit(context, 'update-from-menu.sh', [result['package-path']]);
-    }, 450);
+      showUpdateDialog(context, parentWindow, {
+        type: 'error',
+        title: 'ChatGPT Updates',
+        message: 'Some enabled patches are incompatible with this version.',
+        detail: `ChatGPT ${result['available-version'] || 'new'} is ready to install.\n\nPatch status:\n${formatPatchReports(reports)}\n\nThe incompatible patches will be disabled if you continue.`,
+        actions: [
+          { id: 'install', label: 'Install Without Them', primary: true },
+          { id: 'cancel', label: 'Cancel' },
+        ],
+        buttons: ['Install Without Them', 'Cancel'],
+        cancelId: 1,
+        defaultId: 0,
+      }).then(({ response }) => {
+        if (response === 0) continueInstallation(true);
+      }).catch(() => {});
+      return;
+    }
+    updateDownloadWindow(downloadWindow, 75, 'Package extracted and validated. Installing the update...');
+    continueInstallation(false);
   };
   let outputLineBuffer = '';
   child.stdout.on('data', (chunk) => {
@@ -471,7 +633,10 @@ function downloadAndInstallUpdate(context, parentWindow, version, etag) {
     const lines = outputLineBuffer.split(/\r?\n/);
     outputLineBuffer = lines.pop() || '';
     for (const line of lines) {
-      if (line.startsWith('progress=')) updateDownloadWindow(downloadWindow, line.slice(9));
+      if (line.startsWith('progress=')) {
+        const downloaded = Number(line.slice(9)) || 0;
+        updateDownloadWindow(downloadWindow, downloaded * 0.7, `${downloaded}% downloaded`);
+      }
     }
   });
   child.stderr.on('data', (chunk) => {
@@ -499,23 +664,60 @@ function spawnAfterQuit(context, helperName, extraArguments = []) {
   context.externalActionStarted = true;
   const helper = path.join(context.runtimeRoot, helperName);
   const cliPath = path.join(context.appRoot, 'bin', 'chatgpt');
-  const child = spawn('/bin/sh', [helper, context.appRoot, String(process.pid), cliPath, ...extraArguments], {
+  const helperArguments = [helper, context.appRoot, String(process.pid), cliPath, ...extraArguments];
+  const quit = () => {
+    diagnostic(`update-menu: updater helper launch accepted for ${helperName}`);
+    context.electron.app.quit();
+  };
+  const launchFallback = () => {
+    const child = spawn('/bin/sh', helperArguments, {
+      detached: true,
+      stdio: 'ignore',
+    });
+    child.once('error', (error) => diagnostic(`update-menu: updater helper failed to start: ${error.message}`));
+    child.unref();
+    quit();
+  };
+
+  const systemdRun = process.platform === 'linux' && commandOnPath('systemd-run');
+  if (!systemdRun) {
+    diagnostic('update-menu: systemd-run unavailable; using detached updater fallback');
+    launchFallback();
+    return;
+  }
+
+  const unit = `chatgpt-update-${process.pid}-${Date.now()}`;
+  diagnostic(`update-menu: launching updater through systemd user unit ${unit}`);
+  const child = spawn('systemd-run', [
+    '--user',
+    '--quiet',
+    '--collect',
+    '--unit',
+    unit,
+    '--',
+    '/bin/sh',
+    ...helperArguments,
+  ], {
     detached: true,
     stdio: 'ignore',
   });
-  child.once('error', (error) => diagnostic(`update-menu: updater helper failed to start: ${error.message}`));
-  child.unref();
-  context.electron.app.quit();
-  // Some packaged builds prevent quit while a local session is active. The
-  // updater helper must still get a reliable process exit after a short grace
-  // period; it waits for this PID before replacing application files.
-  setTimeout(() => {
-    try {
-      context.electron.app.exit(0);
-    } catch (_) {
-      // The app may already have exited cleanly.
+  let launchCompleted = false;
+  const fallbackIfNeeded = (reason) => {
+    if (launchCompleted) return;
+    launchCompleted = true;
+    diagnostic(`update-menu: systemd updater launch failed${reason ? `: ${reason}` : ''}; using detached fallback`);
+    launchFallback();
+  };
+  child.once('error', (error) => fallbackIfNeeded(error.message));
+  child.once('close', (exitCode) => {
+    if (exitCode === 0) {
+      launchCompleted = true;
+      quit();
+    } else {
+      fallbackIfNeeded(`systemd-run exited with code ${exitCode}`);
     }
-  }, 750).unref();
+  });
+  child.unref();
 }
 
 function addPatchItems(menu, context, MenuItem) {

@@ -122,16 +122,30 @@ of the Debian package. It uses the saved `ETag` and HTTP Range requests, so the
 full package is not downloaded during a normal check.
 
 When an update is accepted, the full package is downloaded with progress while
-ChatGPT remains open. Once the download is complete, ChatGPT closes, the
-payload is replaced, the selected patches are reapplied, and the app relaunches.
+ChatGPT remains open. Before the replacement, the package is extracted, its
+runtime dependencies are validated, and the selected native-decoration patch
+is tested against the new `app.asar` in an isolated staging directory. The
+transactional replacement then happens while the current process is still
+running; existing processes keep their already-loaded code, and the next
+launch uses the new payload. The app reports every enabled patch as compatible
+or incompatible. Incompatible patches can be disabled explicitly before
+continuing, and the app then offers `Restart Now` or `Later`.
 
 The update state and temporary package are stored inside the selected
-installation directory under `state/` and `update-cache/`. Automatic checks
+installation directory under `state/` and `update-cache/`. A staged update is
+kept there until the replacement completes. Automatic checks
 are limited to once per hour because they run during application startup, but
 they only request package metadata rather than downloading the full package.
 If a previous successful check already found a newer version, that cached
 result is shown on startup even while the network check is throttled. Failed
 network checks do not advance the successful-check timestamp.
+
+The native-decoration toggle still uses a short-lived helper and records its
+lifecycle in `state/update-from-menu.log` and
+`state/update-from-menu.status` (`running`, `success`, or `failed:*`). On
+Linux that helper is launched as a transient `systemd --user` service so it is
+not terminated with the desktop application's process group; a detached
+fallback is used when a user service manager is unavailable.
 
 ## Installed layout
 
@@ -150,7 +164,7 @@ The installed tree deliberately uses semantic names:
   patches/update-menu/
   patches/native-window-decorations/
   state/
-  update-cache/
+  update-cache/                         Downloaded package and staged updates
 
 ~/.local/bin/chatgpt                      Symlink to bin/chatgpt
 ~/.config/chatgpt/settings.conf           Installation settings
