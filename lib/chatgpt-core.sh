@@ -15,7 +15,6 @@ MIME_APPS_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/mimeapps.list
 COMMAND_PATH=$HOME/.local/bin/chatgpt
 CODEX_DIRECTORY=$HOME/.codex
 DEFAULT_ROOT=$HOME/Apps/chatgpt-linux
-NATIVE_DECORATION_PATCH=chatgpt-native-window-decorations.py
 NATIVE_DECORATION_OVERRIDE=
 PATCHES=
 INSTALLED_PACKAGE_VERSION=
@@ -58,15 +57,16 @@ usage() {
 
 chatgpt_usage() {
   printf '%s\n' \
-    'Usage: chatgpt [--no-patches] [update [DECORATION_OPTION]]' \
+    'Usage: chatgpt [--debug] [--no-patches] [update [DECORATION_OPTION]]' \
     '  chatgpt         Open ChatGPT in the current terminal directory' \
     '  chatgpt update  Download and install the latest app version' \
     '  chatgpt check-update  Check remote package metadata' \
     '  chatgpt uninstall [--no-preserve-data]  Remove the local installation' \
     '  chatgpt patches [list|status|enable NAME|disable NAME]' \
+    '  chatgpt --debug  Launch with external patch diagnostics enabled' \
     '  chatgpt --no-patches  Launch once without external patches' \
     '  DECORATION_OPTION: --native-window-decoration or --no-native-window-decoration' \
-    '  NAME: native-window-decorations or update-menu'
+    '  NAME: window-decorations or update-menu'
 }
 
 resolve_self_path() {
@@ -122,23 +122,27 @@ set_native_decoration_override() {
 }
 
 canonical_patch_id() {
-  printf '%s\n' "$1"
+  case "$1" in
+    native-window-decorations) printf '%s\n' 'window-decorations' ;;
+    *) printf '%s\n' "$1" ;;
+  esac
 }
 
 normalize_patch_list() {
-  normalized_patches=$(printf '%s\n' "$PATCHES" | awk -F, '
-    {
-      for (position = 1; position <= NF; position++) {
-        patch = $position
-        if (patch == "") continue
-        if (!seen[patch]++) {
-          if (output != "") output = output ","
-          output = output patch
-        }
-      }
-    }
-    END { print output }
-  ')
+  normalized_patches=
+  old_ifs=$IFS
+  IFS=,
+  for requested_patch in $PATCHES; do
+    IFS=$old_ifs
+    [ -n "$requested_patch" ] || continue
+    normalized_patch=$(canonical_patch_id "$requested_patch")
+    case ",$normalized_patches," in
+      *,"$normalized_patch",*) ;;
+      *) normalized_patches=${normalized_patches:+$normalized_patches,}$normalized_patch ;;
+    esac
+    IFS=,
+  done
+  IFS=$old_ifs
   PATCHES=$normalized_patches
 }
 
@@ -170,19 +174,6 @@ ask_native_decoration_preference() {
   case "$native_decoration_answer" in
     y|Y|yes|Yes|YES) NATIVE_DECORATIONS=1 ;;
   esac
-}
-
-require_native_decoration_tools() {
-  [ "$NATIVE_DECORATIONS" -eq 0 ] && return 0
-  command -v python3 >/dev/null 2>&1 \
-    || die 'native window decorations require python3'
-  if [ -r "$SOURCE_DIRECTORY/runtime/$NATIVE_DECORATION_PATCH" ]; then
-    return 0
-  fi
-  if [ -n "${APP_ROOT-}" ] && [ -r "$APP_ROOT/runtime/$NATIVE_DECORATION_PATCH" ]; then
-    return 0
-  fi
-  die "native decoration patch script is missing: $NATIVE_DECORATION_PATCH"
 }
 
 check_host_libraries() {
@@ -693,14 +684,16 @@ write_run_launcher() {
     'export CHATGPT_APP_ROOT="$APP_ROOT"' \
     'if [ -r "$APP_ROOT/usr/lib/chatgpt/version" ]; then export CHATGPT_APP_VERSION=$(awk "NR==1 {print; exit}" "$APP_ROOT/usr/lib/chatgpt/version"); fi' \
     'CONFIG_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/chatgpt/settings.conf' \
+    'export CHATGPT_CONFIG_FILE="$CONFIG_FILE"' \
     'USER_DATA_DIRECTORY=${XDG_CONFIG_HOME:-$HOME/.config}/chatgpt/user-data' \
     'mkdir -p "$USER_DATA_DIRECTORY"' \
     'if [ -r "$CONFIG_FILE" ]; then export CHATGPT_PATCHES=$(awk -F= '\''$1 == "patches" {print $2; exit}'\'' "$CONFIG_FILE"); fi' \
-    'if [ -r "$CONFIG_FILE" ]; then export CHATGPT_NATIVE_DECORATIONS=$(awk -F= '\''$1 == "native_decorations" {print $2; exit}'\'' "$CONFIG_FILE"); fi' \
+    'if [ "${CHATGPT_DEBUG-0}" = 1 ]; then export CHATGPT_PATCH_DIAGNOSTIC="$APP_ROOT/state/patch-diagnostic.log"; fi' \
     'if [ "${CHATGPT_NO_PATCHES-0}" != 1 ] && [ -n "${CHATGPT_PATCHES-}" ]; then' \
     '  export CHATGPT_PATCH_ROOT="$APP_ROOT"' \
     '  export NODE_OPTIONS="${NODE_OPTIONS-} --require=$APP_ROOT/runtime/patch-loader.js"' \
     'fi' \
+    'if [ "$#" -gt 0 ] && [ "$1" = "$APP_ROOT/usr/lib/chatgpt/resources/app.asar" ]; then shift; fi' \
     'exec "$APP_ROOT/usr/lib/chatgpt/ChatGPT" \' \
     '  --user-data-dir="$USER_DATA_DIRECTORY" \' \
     '  "$@"' > "$launcher_path"
@@ -711,7 +704,7 @@ set_patch_enabled() {
   patch_id=$(canonical_patch_id "$1")
   requested_state=$2
   case "$patch_id" in
-    native-window-decorations|update-menu) ;;
+    window-decorations|update-menu) ;;
     *) die "unknown patch: $patch_id" ;;
   esac
 
@@ -724,15 +717,10 @@ set_patch_enabled() {
       ;;
   esac
 
-  if [ "$patch_id" = native-window-decorations ]; then
+  if [ "$patch_id" = window-decorations ]; then
     if [ "$requested_state" = enable ]; then
-      require_native_decoration_tools
-      python3 "$APP_ROOT/runtime/$NATIVE_DECORATION_PATCH" --apply \
-        || die 'native decoration patch could not be applied; restart ChatGPT after fixing the reported build issue'
       NATIVE_DECORATIONS=1
     else
-      python3 "$APP_ROOT/runtime/$NATIVE_DECORATION_PATCH" --restore \
-        || die 'native decoration patch could not be restored'
       NATIVE_DECORATIONS=0
     fi
   fi
@@ -749,9 +737,8 @@ copy_support_files() {
     "$support_source/lib/chatgpt-core.sh" \
     "$support_source/bin/chatgpt" \
     "$support_source/runtime/patch-loader.js" \
-    "$support_source/runtime/chatgpt-update-from-menu.sh" \
-    "$support_source/runtime/chatgpt-toggle-native-decorations.sh" \
-    "$support_source/runtime/chatgpt-native-window-decorations.py"; do
+    "$support_source/runtime/settings.js" \
+    "$support_source/runtime/chatgpt-toggle-window-decorations.sh"; do
     [ -r "$support_file" ] || die "required ChatGPT support file is missing: $support_file"
   done
 
@@ -761,14 +748,14 @@ copy_support_files() {
   cp "$support_source/lib/chatgpt-core.sh" "$support_temporary/lib/chatgpt-core.sh"
   cp "$support_source/bin/chatgpt" "$support_temporary/bin/chatgpt"
   cp "$support_source/runtime/patch-loader.js" "$support_temporary/runtime/patch-loader.js"
-  cp "$support_source/runtime/chatgpt-update-from-menu.sh" "$support_temporary/runtime/chatgpt-update-from-menu.sh"
-  cp "$support_source/runtime/chatgpt-toggle-native-decorations.sh" "$support_temporary/runtime/chatgpt-toggle-native-decorations.sh"
-  cp "$support_source/runtime/chatgpt-native-window-decorations.py" "$support_temporary/runtime/chatgpt-native-window-decorations.py"
+  cp "$support_source/runtime/settings.js" "$support_temporary/runtime/settings.js"
+  cp "$support_source/runtime/chatgpt-toggle-window-decorations.sh" "$support_temporary/runtime/chatgpt-toggle-window-decorations.sh"
   cp -a "$support_source/patches/update-menu" "$support_temporary/patches/"
-  cp -a "$support_source/patches/native-window-decorations" "$support_temporary/patches/"
+  cp -a "$support_source/patches/window-decorations" "$support_temporary/patches/"
   chmod 644 "$support_temporary/lib/chatgpt-core.sh" "$support_temporary/runtime/patch-loader.js" "$support_temporary/patches"/*/*.js "$support_temporary/patches"/*/*.json
-  chmod 755 "$support_temporary/bin/chatgpt" "$support_temporary/runtime/chatgpt-native-window-decorations.py"
-  chmod 755 "$support_temporary/runtime/chatgpt-update-from-menu.sh" "$support_temporary/runtime/chatgpt-toggle-native-decorations.sh"
+  chmod 644 "$support_temporary/runtime/settings.js"
+  chmod 755 "$support_temporary/runtime/chatgpt-toggle-window-decorations.sh"
+  chmod 755 "$support_temporary/bin/chatgpt"
 
   backup_support="$temporary_root/original-support"
   if [ -e "$APP_ROOT/bin" ] || [ -e "$APP_ROOT/lib" ] || [ -e "$APP_ROOT/runtime" ] || [ -e "$APP_ROOT/patches" ]; then
@@ -810,48 +797,6 @@ write_command_link() {
   fi
 }
 
-write_native_decoration_patch() {
-  patch_source=
-  if [ -r "$SOURCE_DIRECTORY/runtime/$NATIVE_DECORATION_PATCH" ]; then
-    patch_source=$SOURCE_DIRECTORY/runtime/$NATIVE_DECORATION_PATCH
-  elif [ -r "$APP_ROOT/runtime/$NATIVE_DECORATION_PATCH" ]; then
-    patch_source=$APP_ROOT/runtime/$NATIVE_DECORATION_PATCH
-  fi
-  if [ -z "$patch_source" ]; then
-    printf 'chatgpt: native decoration patch script is missing: %s\n' "$NATIVE_DECORATION_PATCH" >&2
-    return 1
-  fi
-
-  patch_temporary="$APP_ROOT/runtime/$NATIVE_DECORATION_PATCH.$$"
-  if ! cp "$patch_source" "$patch_temporary"; then
-    printf '%s\n' 'chatgpt: could not install the native decoration patch script' >&2
-    return 1
-  fi
-  chmod u+x "$patch_temporary"
-  mv -f "$patch_temporary" "$APP_ROOT/runtime/$NATIVE_DECORATION_PATCH"
-}
-
-apply_native_decoration_patch() {
-  [ "$NATIVE_DECORATIONS" -eq 1 ] || return 0
-  python3 "$APP_ROOT/runtime/$NATIVE_DECORATION_PATCH" --apply || return 1
-  printf '%s\n' 'Native system window decorations enabled.'
-}
-
-apply_native_decoration_patch_to_root() {
-  target_root=$1
-  patch_script="$APP_ROOT/runtime/$NATIVE_DECORATION_PATCH"
-  [ -r "$patch_script" ] || patch_script="$SOURCE_DIRECTORY/runtime/$NATIVE_DECORATION_PATCH"
-  [ -r "$patch_script" ] || return 1
-  [ "$NATIVE_DECORATIONS" -eq 1 ] || return 0
-  if [ "$target_root" = "$APP_ROOT" ]; then
-    python3 "$patch_script" --apply
-  else
-    CHATGPT_PATCH_APP_ROOT="$target_root" \
-      CHATGPT_PATCH_BACKUP_DIRECTORY="$APP_ROOT/update-cache" \
-      python3 "$patch_script" --apply
-  fi
-}
-
 patch_manifest_path() {
   patch_id=$1
   if [ -r "$SOURCE_DIRECTORY/patches/$patch_id/manifest.json" ]; then
@@ -890,7 +835,6 @@ check_candidate_patch_compatibility() {
   report_file=$prepared_root/patch-report
   candidate_version=$(awk 'NR == 1 {print; exit}' "$prepared_root/usr/lib/chatgpt/version" 2>/dev/null || true)
   : > "$report_file"
-  PREPARED_NATIVE_PATCHED=0
   PREPARED_HAS_INCOMPATIBLE_PATCH=0
 
   for patch_id in $(printf '%s' "$PATCHES" | tr ',' ' '); do
@@ -920,18 +864,6 @@ check_candidate_patch_compatibility() {
       continue
     fi
 
-    if [ "$patch_id" = native-window-decorations ] && [ "$NATIVE_DECORATIONS" -eq 1 ]; then
-      native_patch_output=
-      native_patch_status=0
-      native_patch_output=$(apply_native_decoration_patch_to_root "$prepared_root" 2>&1) || native_patch_status=$?
-      if [ "$native_patch_status" -ne 0 ]; then
-        native_patch_reason=$(printf '%s\n' "$native_patch_output" | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g')
-        record_patch_report "$report_file" "$patch_id" "$patch_name" incompatible "native ASAR patch failed: ${native_patch_reason:-unknown error}"
-        PREPARED_HAS_INCOMPATIBLE_PATCH=1
-        continue
-      fi
-      PREPARED_NATIVE_PATCHED=1
-    fi
     record_patch_report "$report_file" "$patch_id" "$patch_name" compatible "supported by ChatGPT runtime $candidate_version"
   done
 
@@ -962,8 +894,9 @@ disable_incompatible_staged_patches() {
   report_file=$1
   while IFS='|' read -r report_id report_name report_status report_detail; do
     [ "$report_status" = incompatible ] || continue
+    report_id=$(canonical_patch_id "$report_id")
     disable_patch "$report_id"
-    [ "$report_id" = native-window-decorations ] || continue
+    [ "$report_id" = window-decorations ] || continue
     NATIVE_DECORATIONS=0
   done < "$report_file"
 }
@@ -972,7 +905,17 @@ write_config() {
   config_directory=$(dirname -- "$CONFIG_FILE")
   mkdir -p "$config_directory"
   config_temporary="$CONFIG_FILE.$$"
-  printf '%s\n' "$APP_ROOT" "native_decorations=$NATIVE_DECORATIONS" "patches=$PATCHES" "package_version=${INSTALLED_PACKAGE_VERSION-}" > "$config_temporary"
+  if [ "$NATIVE_DECORATIONS" -eq 1 ]; then
+    use_system_window_decorations=true
+  else
+    use_system_window_decorations=false
+  fi
+  printf '%s\n' \
+    "$APP_ROOT" \
+    "use_system_window_decorations=$use_system_window_decorations" \
+    "native_decorations=$NATIVE_DECORATIONS" \
+    "patches=$PATCHES" \
+    "package_version=${INSTALLED_PACKAGE_VERSION-}" > "$config_temporary"
   chmod 600 "$config_temporary"
   mv -f "$config_temporary" "$CONFIG_FILE"
 }
@@ -1140,16 +1083,9 @@ install_prepared_payload() {
       || die 'could not install the downloaded var files'
   fi
   copy_support_files
-  write_native_decoration_patch || die 'could not install the native decoration patch helper'
   launcher_temporary="$temporary_root/chatgpt-launcher"
   write_run_launcher "$launcher_temporary"
   mv -f "$launcher_temporary" "$APP_ROOT/bin/chatgpt-launcher"
-  if [ "$NATIVE_DECORATIONS" -eq 1 ] && [ "${PREPARED_NATIVE_PATCHED-0}" -ne 1 ]; then
-    if ! write_native_decoration_patch || ! apply_native_decoration_patch; then
-      rollback_payload
-      die 'could not apply the native window decoration patch; the previous payload was restored'
-    fi
-  fi
   printf 'Application payload installed in %s.\n' "$APP_ROOT"
 }
 
@@ -1239,11 +1175,6 @@ install_staged_app() {
   elif awk -F'|' '$3 == "incompatible" {found=1} END {exit !found}' "$staged_report_file" 2>/dev/null; then
     die 'the staged update contains incompatible enabled patches; confirm installation without them'
   fi
-  PREPARED_NATIVE_PATCHED=0
-  if [ "$NATIVE_DECORATIONS" -eq 1 ] \
-    && awk -F'|' '$1 == "native-window-decorations" && $3 == "compatible" {found=1} END {exit !found}' "$staged_report_file" 2>/dev/null; then
-    PREPARED_NATIVE_PATCHED=1
-  fi
   version_is_newer "$staged_package_version" "$INSTALLED_PACKAGE_VERSION" \
     || die 'the staged update is not newer than the installed package'
   [ -d "$staging_root/payload" ] || die 'staged update payload is missing'
@@ -1265,12 +1196,21 @@ load_configured_root() {
     [ -x "$APP_ROOT/bin/chatgpt-launcher" ] || die "ChatGPT launcher not found in $APP_ROOT"
   fi
   [ "$load_mode" = uninstall ] && return 0
-  NATIVE_DECORATIONS=$(awk -F= '$1 == "native_decorations" {print $2; exit}' "$CONFIG_READ_FILE")
-  NATIVE_DECORATIONS=${NATIVE_DECORATIONS:-0}
-  case "$NATIVE_DECORATIONS" in
-    0|1) ;;
-    *) die "invalid native decoration setting in $CONFIG_FILE" ;;
-  esac
+  configured_window_decorations=$(awk -F= '$1 == "use_system_window_decorations" {print $2; exit}' "$CONFIG_READ_FILE")
+  if [ -n "$configured_window_decorations" ]; then
+    case "$configured_window_decorations" in
+      true|yes|on|1) NATIVE_DECORATIONS=1 ;;
+      false|no|off|0) NATIVE_DECORATIONS=0 ;;
+      *) die "invalid system window decoration setting in $CONFIG_FILE" ;;
+    esac
+  else
+    NATIVE_DECORATIONS=$(awk -F= '$1 == "native_decorations" {print $2; exit}' "$CONFIG_READ_FILE")
+    NATIVE_DECORATIONS=${NATIVE_DECORATIONS:-0}
+    case "$NATIVE_DECORATIONS" in
+      0|1) ;;
+      *) die "invalid native decoration setting in $CONFIG_FILE" ;;
+    esac
+  fi
   PATCHES=$(awk -F= '$1 == "patches" {print $2; exit}' "$CONFIG_READ_FILE")
   INSTALLED_PACKAGE_VERSION=$(awk -F= '$1 == "package_version" {print $2; exit}' "$CONFIG_READ_FILE")
   if [ -z "$INSTALLED_PACKAGE_VERSION" ] \
@@ -1281,17 +1221,15 @@ load_configured_root() {
   patches_setting=$(awk -F= '$1 == "patches" {print "present"; exit}' "$CONFIG_READ_FILE")
   if [ -z "$patches_setting" ]; then
     PATCHES=update-menu
-    if [ "$NATIVE_DECORATIONS" -eq 1 ]; then
-      PATCHES=$PATCHES,native-window-decorations
-    elif [ -x "$APP_ROOT/runtime/$NATIVE_DECORATION_PATCH" ] && command -v python3 >/dev/null 2>&1; then
-      native_patch_status=$(python3 "$APP_ROOT/runtime/$NATIVE_DECORATION_PATCH" --status 2>/dev/null || true)
-      case "$native_patch_status" in
-        *'Native decoration patch: applied'*)
-          NATIVE_DECORATIONS=1
-          PATCHES=$PATCHES,native-window-decorations
-          ;;
-      esac
-    fi
+  fi
+  normalize_patch_list
+  if [ "$NATIVE_DECORATIONS" -eq 1 ]; then
+    case ",$PATCHES," in
+      *,window-decorations,*) ;;
+      *) PATCHES=${PATCHES:+$PATCHES,}window-decorations ;;
+    esac
+  else
+    PATCHES=$(printf '%s' ",$PATCHES," | awk -v p=",window-decorations," '{gsub(p,","); gsub(/^,|,$/,""); gsub(/,,+/,","); print}')
   fi
   normalize_patch_list
 }
@@ -1441,9 +1379,8 @@ install_app() {
   check_desktop_helpers || exit 1
   ask_native_decoration_preference
   PATCHES=update-menu
-  [ "$NATIVE_DECORATIONS" -eq 0 ] || PATCHES=$PATCHES,native-window-decorations
+  [ "$NATIVE_DECORATIONS" -eq 0 ] || PATCHES=$PATCHES,window-decorations
   resolve_install_root "$1"
-  require_native_decoration_tools
   prepare_install_root
   install_payload
   finish_install
@@ -1459,12 +1396,11 @@ update_app() {
   if [ -n "$NATIVE_DECORATION_OVERRIDE" ]; then
     NATIVE_DECORATIONS=$NATIVE_DECORATION_OVERRIDE
     if [ "$NATIVE_DECORATIONS" -eq 1 ]; then
-      case ",$PATCHES," in *,native-window-decorations,*) ;; *) PATCHES=${PATCHES:+$PATCHES,}native-window-decorations ;; esac
+      case ",$PATCHES," in *,window-decorations,*) ;; *) PATCHES=${PATCHES:+$PATCHES,}window-decorations ;; esac
     else
-      PATCHES=$(printf '%s' ",$PATCHES," | awk -v p=",native-window-decorations," '{gsub(p,""); gsub(/^,|,$/,""); gsub(/,,+/,","); print}')
+      PATCHES=$(printf '%s' ",$PATCHES," | awk -v p=",window-decorations," '{gsub(p,""); gsub(/^,|,$/,""); gsub(/,,+/,","); print}')
     fi
   fi
-  require_native_decoration_tools
   if is_running_at "$APP_ROOT"; then
     die 'close ChatGPT before updating it'
   fi
@@ -1551,7 +1487,6 @@ install_package_app() {
   require_host_tools || exit 1
   check_host_libraries || exit 1
   check_desktop_helpers || exit 1
-  require_native_decoration_tools
   if is_running_at "$APP_ROOT"; then
     die 'close ChatGPT before updating it'
   fi
@@ -1563,9 +1498,11 @@ install_package_app() {
 chatgpt_cli_main() {
   resolve_self_path
   NO_PATCHES=0
+  DEBUG=0
   if [ "$#" -gt 0 ]; then
     case "$1" in
       --no-patches) NO_PATCHES=1; shift ;;
+      --debug) DEBUG=1; shift ;;
       --native-window-decoration|--no-native-window-decoration)
         parse_native_decoration_option "$1"
         shift
@@ -1578,6 +1515,7 @@ chatgpt_cli_main() {
   esac
   export CHATGPT_PATCHES=$PATCHES
   export CHATGPT_APP_ROOT=$APP_ROOT
+  if [ "$DEBUG" -eq 1 ]; then export CHATGPT_DEBUG=1; fi
   case "${1-}" in
     '')
       [ -z "$NATIVE_DECORATION_OVERRIDE" ] \
@@ -1625,7 +1563,7 @@ chatgpt_cli_main() {
       [ "$NO_PATCHES" -eq 0 ] || die '--no-patches cannot be used with patch management'
       shift
       case "${1-}" in
-        list) printf '%s\n' 'native-window-decorations' 'update-menu' ;;
+        list) printf '%s\n' 'window-decorations' 'update-menu' ;;
         status) printf 'Enabled patches: %s\n' "${PATCHES:-none}" ;;
          enable|disable)
            [ "$#" -eq 2 ] || die 'usage: chatgpt patches enable|disable NAME'

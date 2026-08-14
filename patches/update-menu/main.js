@@ -12,30 +12,11 @@ function diagnostic(message) {
   const target = process.env.CHATGPT_PATCH_DIAGNOSTIC;
   if (!target) return;
   try {
+    fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.appendFileSync(target, `${message}\n`);
   } catch (_) {
     // Diagnostics must never affect application startup.
   }
-}
-
-function commandOnPath(command) {
-  if (path.isAbsolute(command)) {
-    try {
-      fs.accessSync(command, fs.constants.X_OK);
-      return true;
-    } catch (_) {
-      return false;
-    }
-  }
-  return (process.env.PATH || '').split(path.delimiter).some((directory) => {
-    if (!directory) return false;
-    try {
-      fs.accessSync(path.join(directory, command), fs.constants.X_OK);
-      return true;
-    } catch (_) {
-      return false;
-    }
-  });
 }
 
 function findSubmenu(menu, id, labels) {
@@ -361,13 +342,29 @@ function closeCheckingWindow(checkingWindow) {
   checkingWindow.destroy();
 }
 
+function launcherArguments(context) {
+  const vendorEntry = path.join(context.appRoot, 'usr/lib/chatgpt/resources/app.asar');
+  const argumentsForLauncher = [];
+  const originalArguments = process.argv.slice(1);
+  for (let index = 0; index < originalArguments.length; index += 1) {
+    const argument = originalArguments[index];
+    if (argument === vendorEntry || argument === '--user-data-dir') {
+      if (argument === '--user-data-dir') index += 1;
+      continue;
+    }
+    if (argument.startsWith('--user-data-dir=')) continue;
+    argumentsForLauncher.push(argument);
+  }
+  return argumentsForLauncher;
+}
+
 function restartApp(context) {
   const launcher = path.join(context.appRoot, 'bin', 'chatgpt-launcher');
   const app = context.electron.app;
   try {
     if (typeof app.relaunch === 'function') {
       diagnostic(`update-menu: relaunching through ${launcher}`);
-      app.relaunch({ execPath: launcher, args: process.argv.slice(1) });
+      app.relaunch({ execPath: launcher, args: launcherArguments(context) });
       app.quit();
       return;
     }
@@ -664,60 +661,34 @@ function spawnAfterQuit(context, helperName, extraArguments = []) {
   context.externalActionStarted = true;
   const helper = path.join(context.runtimeRoot, helperName);
   const cliPath = path.join(context.appRoot, 'bin', 'chatgpt');
-  const helperArguments = [helper, context.appRoot, String(process.pid), cliPath, ...extraArguments];
-  const quit = () => {
-    diagnostic(`update-menu: updater helper launch accepted for ${helperName}`);
-    context.electron.app.quit();
-  };
-  const launchFallback = () => {
-    const child = spawn('/bin/sh', helperArguments, {
-      detached: true,
-      stdio: 'ignore',
-    });
-    child.once('error', (error) => diagnostic(`update-menu: updater helper failed to start: ${error.message}`));
-    child.unref();
-    quit();
-  };
-
-  const systemdRun = process.platform === 'linux' && commandOnPath('systemd-run');
-  if (!systemdRun) {
-    diagnostic('update-menu: systemd-run unavailable; using detached updater fallback');
-    launchFallback();
-    return;
-  }
-
-  const unit = `chatgpt-update-${process.pid}-${Date.now()}`;
-  diagnostic(`update-menu: launching updater through systemd user unit ${unit}`);
-  const child = spawn('systemd-run', [
-    '--user',
-    '--quiet',
-    '--collect',
-    '--unit',
-    unit,
-    '--',
-    '/bin/sh',
-    ...helperArguments,
-  ], {
+  const child = spawn('/bin/sh', [helper, context.appRoot, String(process.pid), cliPath, ...extraArguments], {
     detached: true,
     stdio: 'ignore',
   });
-  let launchCompleted = false;
-  const fallbackIfNeeded = (reason) => {
-    if (launchCompleted) return;
-    launchCompleted = true;
-    diagnostic(`update-menu: systemd updater launch failed${reason ? `: ${reason}` : ''}; using detached fallback`);
-    launchFallback();
-  };
-  child.once('error', (error) => fallbackIfNeeded(error.message));
-  child.once('close', (exitCode) => {
-    if (exitCode === 0) {
-      launchCompleted = true;
-      quit();
-    } else {
-      fallbackIfNeeded(`systemd-run exited with code ${exitCode}`);
-    }
-  });
+  child.once('error', (error) => diagnostic(`update-menu: helper failed to start: ${error.message}`));
   child.unref();
+  diagnostic(`update-menu: launched ${helperName}`);
+  context.electron.app.quit();
+}
+
+function addDecorationMenuItem(help, menu, context, MenuItem) {
+  const decorationMenu = help || findSubmenu(menu, 'view-menu', new Set(['view']));
+  if (!decorationMenu || decorationMenu.getMenuItemById?.(DECORATION_ITEM_ID)) return;
+  decorationMenu.append(new MenuItem({ type: 'separator' }));
+  decorationMenu.append(new MenuItem({
+    id: DECORATION_ITEM_ID,
+    label: context.nativeDecorations
+      ? 'Disable Native Window Decorations'
+      : 'Enable Native Window Decorations',
+    click: () => {
+      spawnAfterQuit(
+        context,
+        'chatgpt-toggle-window-decorations.sh',
+        [context.nativeDecorations ? 'disable' : 'enable'],
+      );
+    },
+  }));
+  diagnostic('update-menu: added native decorations to Help');
 }
 
 function addPatchItems(menu, context, MenuItem) {
@@ -733,25 +704,7 @@ function addPatchItems(menu, context, MenuItem) {
     }));
     diagnostic('update-menu: added Check for Updates to Help');
   }
-
-  const decorationMenu = help || findSubmenu(menu, 'view-menu', new Set(['view']));
-  if (decorationMenu && !decorationMenu.getMenuItemById?.(DECORATION_ITEM_ID)) {
-    decorationMenu.append(new MenuItem({ type: 'separator' }));
-    decorationMenu.append(new MenuItem({
-      id: DECORATION_ITEM_ID,
-      label: context.nativeDecorations
-        ? 'Disable Native Window Decorations'
-        : 'Enable Native Window Decorations',
-      click: () => {
-        spawnAfterQuit(
-          context,
-          'chatgpt-toggle-native-decorations.sh',
-          [context.nativeDecorations ? 'disable' : 'enable'],
-        );
-      },
-    }));
-    diagnostic('update-menu: added native decorations to Help');
-  }
+  addDecorationMenuItem(help, menu, context, MenuItem);
 }
 
 module.exports = {
@@ -760,6 +713,7 @@ module.exports = {
     const electron = context.electron;
     const { Menu, MenuItem, app } = electron;
     if (!Menu || !MenuItem || !app) return;
+    if (typeof Menu.setApplicationMenu !== 'function') return;
     if (Menu.setApplicationMenu.__chatgptExternalUpdatePatch) return;
 
     const originalSetApplicationMenu = Menu.setApplicationMenu;

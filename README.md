@@ -13,9 +13,12 @@ not use `dpkg`, `apt`, AUR build scripts, `sudo`, or system package databases.
 - Preserves the local profile and authentication data during updates.
 - Supports `chatgpt update`, `check-update`, `patches`, and `uninstall`.
 - Adds a user-level `chatgpt.desktop` launcher matching the package name.
-- Optionally enables native Linux window decorations.
-- Provides a themed `Help -> Check for Updates...` workflow.
-- Keeps all optional patches outside the downloaded `app.asar`.
+- Optionally enables native Linux/KDE window decorations through external
+  runtime injection, without modifying `app.asar`.
+- Provides themed `Help -> Check for Updates...` and native-decoration toggle
+  items.
+- Treats the downloaded application, including `app.asar`, as immutable vendor
+  code. All patches live in the installed launcher/runtime layer.
 
 ## Requirements
 
@@ -27,7 +30,7 @@ The installer checks for the host tools needed for extraction, dependency
 inspection, desktop integration, and updates, including `curl`, `ar`, `tar`,
 `xz`, `ldd`, `ldconfig`, `awk`, `readlink`, `ln`, `xdg-open`, and `xdg-mime`.
 It also checks the GUI libraries required by Electron and the bundled Codex
-runtime. Native window decorations additionally require `python3`.
+runtime. Native window decorations do not require Python or system services.
 
 ## Installation
 
@@ -71,6 +74,7 @@ chatgpt                         # Open the current directory as a project
 chatgpt [APP_OPTIONS...]        # Launch with app arguments
 chatgpt update                  # Download and install the latest version
 chatgpt check-update            # Check package metadata only
+chatgpt --debug                 # Launch with patch diagnostics enabled
 chatgpt patches status          # Show enabled patches
 chatgpt uninstall               # Remove the app but preserve user data
 chatgpt uninstall --no-preserve-data
@@ -98,22 +102,29 @@ chatgpt update --no-native-window-decoration
 chatgpt patches list
 chatgpt patches status
 chatgpt patches enable update-menu
-chatgpt patches disable native-window-decorations
+chatgpt patches enable window-decorations
+chatgpt patches disable window-decorations
 chatgpt --no-patches
 ```
 
-The two bundled patches are:
+The bundled external patches are:
 
-- `update-menu`: adds the update and native-decoration actions to the Help
-  menu and performs lightweight startup update checks, throttled to once per
-  hour.
-- `native-window-decorations`: records the native-decoration capability. The
-  stable implementation remains the verified exact-match ASAR patch.
+- `update-menu`: adds `Help -> Check for Updates...` and performs lightweight
+  startup update checks, plus the native-decoration menu item. The menu action
+  invokes the shared external helper and relaunches the app.
+- `window-decorations`: when enabled on Linux, intercepts Electron's
+  `BrowserWindow` module before the vendor application receives it. It removes
+  hidden title-bar options, forces `frame: true` for normal top-level windows,
+  and ignores `setTitleBarOverlay`. Transparent, modal, parented, and utility
+  windows are left unchanged.
 
 Patches are loaded through `NODE_OPTIONS` before the app's first real
-`require('electron')`. A patch with an invalid manifest, incompatible version,
-or startup exception is skipped with a warning so it cannot make the app
-unlaunchable.
+`require('electron')`. The loader exposes an invariant-safe Electron module
+proxy so the external decoration patch can replace `BrowserWindow` without
+touching vendor files. A patch with an invalid manifest or startup exception
+is skipped with a warning so it cannot make the app unlaunchable. Use
+`chatgpt --debug` to write runtime diagnostics to
+`<installation>/state/patch-diagnostic.log`.
 
 ## Update flow
 
@@ -122,14 +133,12 @@ of the Debian package. It uses the saved `ETag` and HTTP Range requests, so the
 full package is not downloaded during a normal check.
 
 When an update is accepted, the full package is downloaded with progress while
-ChatGPT remains open. Before the replacement, the package is extracted, its
-runtime dependencies are validated, and the selected native-decoration patch
-is tested against the new `app.asar` in an isolated staging directory. The
-transactional replacement then happens while the current process is still
-running; existing processes keep their already-loaded code, and the next
-launch uses the new payload. The app reports every enabled patch as compatible
-or incompatible. Incompatible patches can be disabled explicitly before
-continuing, and the app then offers `Restart Now` or `Later`.
+ChatGPT remains open. Before the replacement, the package is extracted and
+its runtime dependencies are validated in an isolated staging directory. The
+transactional replacement then installs the new vendor payload and external
+runtime together; no file inside the vendor `app.asar` is unpacked, patched, or
+repacked. The app reports every enabled patch as compatible or incompatible,
+then offers `Restart Now` or `Later`.
 
 The update state and temporary package are stored inside the selected
 installation directory under `state/` and `update-cache/`. A staged update is
@@ -140,12 +149,11 @@ If a previous successful check already found a newer version, that cached
 result is shown on startup even while the network check is throttled. Failed
 network checks do not advance the successful-check timestamp.
 
-The native-decoration toggle still uses a short-lived helper and records its
-lifecycle in `state/update-from-menu.log` and
-`state/update-from-menu.status` (`running`, `success`, or `failed:*`). On
-Linux that helper is launched as a transient `systemd --user` service so it is
-not terminated with the desktop application's process group; a detached
-fallback is used when a user service manager is unavailable.
+The native-decoration toggle saves its preference in `settings.conf`, waits for
+the current app process to exit, runs the shared `chatgpt patches` command, and
+relaunches through `bin/chatgpt-launcher`. The external injection is therefore
+still present after the restart. Updating the vendor payload does not require a
+post-update repatching step.
 
 ## Installed layout
 
@@ -158,11 +166,11 @@ The installed tree deliberately uses semantic names:
   bin/chatgpt-launcher                   Electron process launcher
   lib/chatgpt-core.sh                    Shared shell implementation
   runtime/patch-loader.js                External patch loader
-  runtime/chatgpt-update-from-menu.sh    Menu update helper
-  runtime/chatgpt-toggle-native-decorations.sh
-  runtime/chatgpt-native-window-decorations.py
+  runtime/settings.js                    Persistent runtime settings reader
+  runtime/chatgpt-toggle-window-decorations.sh
+                                        Native-decoration menu helper
   patches/update-menu/
-  patches/native-window-decorations/
+  patches/window-decorations/
   state/
   update-cache/                         Downloaded package and staged updates
 
@@ -172,9 +180,12 @@ The installed tree deliberately uses semantic names:
 ~/.local/share/applications/chatgpt.desktop
 ```
 
-`settings.conf` stores the installation root, native-decoration preference,
-enabled patches, and installed package version. The installer intentionally
-does not contain compatibility code for older layouts.
+`settings.conf` stores only installation state: the installation root, the
+`use_system_window_decorations` preference, enabled patches, and installed
+package version. Session and profile data live under `user-data/`, while Codex
+data remains under `~/.codex`. The old `native_decorations` key is read as a
+compatibility fallback and is written alongside the canonical setting so an
+existing personal installation continues to work.
 
 When replacing an older personal installation, run its existing
 `chatgpt uninstall` first, preserving the profile and configuration. Before
@@ -219,15 +230,11 @@ https://persistent.oaistatic.com/codex-app-prod/linux/deb/latest/chatgpt_amd64.d
 
 The installer validates the package name, architecture, Debian metadata,
 required payload files, and dynamic dependencies before replacing an existing
-payload. Payload replacement is transactional: if extraction, support-file
-installation, or the native-decoration patch fails, the previous payload is
-restored and temporary package files are removed. Preserved user data is not
-part of the replacement transaction. Debian maintainer scripts are never
-executed.
-
-The native-decoration patch uses exact byte matches, version/hash-specific
-backups, a lock, and atomic writes. If the packaged code no longer matches the
-verified build, the patch refuses to modify the ASAR archive.
+payload. Payload replacement is transactional: if extraction or support-file
+installation fails, the previous payload is restored and temporary package
+files are removed. Preserved user data is not part of the replacement
+transaction. Debian maintainer scripts are never executed. The vendor payload,
+including `app.asar`, is never modified by this project.
 
 ## Limitations
 
@@ -235,7 +242,10 @@ verified build, the patch refuses to modify the ASAR archive.
 - Host GUI libraries are still required; the payload is not a complete system
   image.
 - ChatGPT must be closed before replacing application files.
-- Native decorations are tied to the verified packaged application build.
+- Native decorations depend on the external Electron interception remaining
+  compatible with the bundled runtime; failures fall back to the original
+  window behavior and are visible with `chatgpt --debug`. The vendor `app.asar`
+  is intentionally never modified.
 - Moving the selected installation directory manually requires reinstalling
   or recreating the `~/.local/bin/chatgpt` symlink.
 
