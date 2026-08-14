@@ -104,8 +104,8 @@ chatgpt update --no-native-window-decoration
 chatgpt patches list
 chatgpt patches status
 chatgpt patches enable update-menu
-chatgpt patches enable window-decorations
-chatgpt patches disable window-decorations
+chatgpt patches enable native-window-decorations
+chatgpt patches disable native-window-decorations
 chatgpt --no-patches
 ```
 
@@ -113,7 +113,7 @@ The bundled external patches are:
 
 - `update-menu`: adds `Help -> Check for Updates...` and performs lightweight
   startup update checks.
-- `window-decorations`: a complete native-decoration package. Its `index.js`
+- `native-window-decorations`: a complete native-decoration package. Its `index.js`
   coordinates the two parts below:
   - `window-decoration.js` intercepts Electron's `BrowserWindow` module before
     the vendor application receives it. It removes hidden title-bar options,
@@ -175,7 +175,7 @@ The installed tree deliberately uses semantic names:
   runtime/chatgpt-toggle-window-decorations.sh
                                         Native-decoration menu helper
   patches/update-menu/
-  patches/window-decorations/
+  patches/native-window-decorations/
     index.js                            Patch entrypoint
     window-decoration.js                Electron window interception
     window-decoration-menu.js           Help menu integration

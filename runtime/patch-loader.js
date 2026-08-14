@@ -30,17 +30,14 @@ const appVersion = process.env.CHATGPT_APP_VERSION || installedVersion;
 // The installed runtime version file is the verified compatibility identifier.
 const electronVersion = process.env.CHATGPT_ELECTRON_VERSION || installedVersion;
 const cliPath = process.env.CHATGPT_CLI_PATH || '';
-const patchAliases = {
-  'native-window-decorations': 'window-decorations',
-};
 const requested = (process.env.CHATGPT_PATCHES || '')
   .split(',')
-  .map((name) => patchAliases[name.trim()] || name.trim())
+  .map((name) => name.trim())
   .filter(Boolean);
 const uniqueRequested = [...new Set(requested)];
 const settings = settingsModule.readSettings();
-if (settings.systemWindowDecorations && !uniqueRequested.includes('window-decorations')) {
-  uniqueRequested.push('window-decorations');
+if (settings.systemWindowDecorations && !uniqueRequested.includes('native-window-decorations')) {
+  uniqueRequested.push('native-window-decorations');
 }
 let electronModuleProxy;
 

@@ -67,7 +67,7 @@ chatgpt_usage() {
     '  chatgpt --debug  Launch with external patch diagnostics enabled' \
     '  chatgpt --no-patches  Launch once without external patches' \
     '  DECORATION_OPTION: --native-window-decoration or --no-native-window-decoration' \
-    '  NAME: window-decorations or update-menu'
+    '  NAME: native-window-decorations or update-menu'
 }
 
 resolve_self_path() {
@@ -123,10 +123,7 @@ set_native_decoration_override() {
 }
 
 canonical_patch_id() {
-  case "$1" in
-    native-window-decorations) printf '%s\n' 'window-decorations' ;;
-    *) printf '%s\n' "$1" ;;
-  esac
+  printf '%s\n' "$1"
 }
 
 normalize_patch_list() {
@@ -705,7 +702,7 @@ set_patch_enabled() {
   patch_id=$(canonical_patch_id "$1")
   requested_state=$2
   case "$patch_id" in
-    window-decorations|update-menu) ;;
+    native-window-decorations|update-menu) ;;
     *) die "unknown patch: $patch_id" ;;
   esac
 
@@ -718,7 +715,7 @@ set_patch_enabled() {
       ;;
   esac
 
-  if [ "$patch_id" = window-decorations ]; then
+  if [ "$patch_id" = native-window-decorations ]; then
     if [ "$requested_state" = enable ]; then
       NATIVE_DECORATIONS=1
     else
@@ -743,8 +740,8 @@ set_native_decorations() {
       ;;
   esac
   case ",$PATCHES," in
-    *,window-decorations,*) ;;
-    *) PATCHES=${PATCHES:+$PATCHES,}window-decorations ;;
+    *,native-window-decorations,*) ;;
+    *) PATCHES=${PATCHES:+$PATCHES,}native-window-decorations ;;
   esac
   normalize_patch_list
   write_config
@@ -774,7 +771,7 @@ copy_support_files() {
   cp "$support_source/runtime/settings.js" "$support_temporary/runtime/settings.js"
   cp "$support_source/runtime/chatgpt-toggle-window-decorations.sh" "$support_temporary/runtime/chatgpt-toggle-window-decorations.sh"
   cp -a "$support_source/patches/update-menu" "$support_temporary/patches/"
-  cp -a "$support_source/patches/window-decorations" "$support_temporary/patches/"
+  cp -a "$support_source/patches/native-window-decorations" "$support_temporary/patches/"
   chmod 644 "$support_temporary/lib/chatgpt-core.sh" "$support_temporary/runtime/patch-loader.js" "$support_temporary/patches"/*/*.js "$support_temporary/patches"/*/*.json
   chmod 644 "$support_temporary/runtime/settings.js"
   chmod 755 "$support_temporary/runtime/chatgpt-toggle-window-decorations.sh"
@@ -919,7 +916,7 @@ disable_incompatible_staged_patches() {
     [ "$report_status" = incompatible ] || continue
     report_id=$(canonical_patch_id "$report_id")
     disable_patch "$report_id"
-    [ "$report_id" = window-decorations ] || continue
+    [ "$report_id" = native-window-decorations ] || continue
     NATIVE_DECORATIONS=0
   done < "$report_file"
 }
@@ -1243,7 +1240,7 @@ load_configured_root() {
   fi
   patches_setting=$(awk -F= '$1 == "patches" {print "present"; exit}' "$CONFIG_READ_FILE")
   if [ -z "$patches_setting" ]; then
-    PATCHES=update-menu,window-decorations
+    PATCHES=update-menu,native-window-decorations
   fi
   normalize_patch_list
 }
@@ -1392,7 +1389,7 @@ install_app() {
   check_host_libraries || exit 1
   check_desktop_helpers || exit 1
   ask_native_decoration_preference
-  PATCHES=update-menu,window-decorations
+  PATCHES=update-menu,native-window-decorations
   resolve_install_root "$1"
   prepare_install_root
   install_payload
@@ -1407,8 +1404,8 @@ update_app() {
   check_desktop_helpers || exit 1
   load_configured_root
   case ",$PATCHES," in
-    *,window-decorations,*) ;;
-    *) PATCHES=${PATCHES:+$PATCHES,}window-decorations ;;
+    *,native-window-decorations,*) ;;
+    *) PATCHES=${PATCHES:+$PATCHES,}native-window-decorations ;;
   esac
   normalize_patch_list
   if [ -n "$NATIVE_DECORATION_OVERRIDE" ]; then
@@ -1576,7 +1573,7 @@ chatgpt_cli_main() {
       [ "$NO_PATCHES" -eq 0 ] || die '--no-patches cannot be used with patch management'
       shift
       case "${1-}" in
-        list) printf '%s\n' 'window-decorations' 'update-menu' ;;
+        list) printf '%s\n' 'native-window-decorations' 'update-menu' ;;
         status) printf 'Enabled patches: %s\n' "${PATCHES:-none}" ;;
          enable|disable)
            [ "$#" -eq 2 ] || die 'usage: chatgpt patches enable|disable NAME'
