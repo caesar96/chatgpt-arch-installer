@@ -5,7 +5,6 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const UPDATE_ITEM_ID = 'chatgpt-check-for-updates';
-const DECORATION_ITEM_ID = 'chatgpt-native-window-decorations';
 const STARTUP_CHECK_DELAY_MS = 3500;
 
 function diagnostic(message) {
@@ -656,41 +655,6 @@ function scheduleStartupCheck(context) {
   else context.electron.app.once?.('ready', schedule);
 }
 
-function spawnAfterQuit(context, helperName, extraArguments = []) {
-  if (context.externalActionStarted) return;
-  context.externalActionStarted = true;
-  const helper = path.join(context.runtimeRoot, helperName);
-  const cliPath = path.join(context.appRoot, 'bin', 'chatgpt');
-  const child = spawn('/bin/sh', [helper, context.appRoot, String(process.pid), cliPath, ...extraArguments], {
-    detached: true,
-    stdio: 'ignore',
-  });
-  child.once('error', (error) => diagnostic(`update-menu: helper failed to start: ${error.message}`));
-  child.unref();
-  diagnostic(`update-menu: launched ${helperName}`);
-  context.electron.app.quit();
-}
-
-function addDecorationMenuItem(help, menu, context, MenuItem) {
-  const decorationMenu = help || findSubmenu(menu, 'view-menu', new Set(['view']));
-  if (!decorationMenu || decorationMenu.getMenuItemById?.(DECORATION_ITEM_ID)) return;
-  decorationMenu.append(new MenuItem({ type: 'separator' }));
-  decorationMenu.append(new MenuItem({
-    id: DECORATION_ITEM_ID,
-    label: context.nativeDecorations
-      ? 'Disable Native Window Decorations'
-      : 'Enable Native Window Decorations',
-    click: () => {
-      spawnAfterQuit(
-        context,
-        'chatgpt-toggle-window-decorations.sh',
-        [context.nativeDecorations ? 'disable' : 'enable'],
-      );
-    },
-  }));
-  diagnostic('update-menu: added native decorations to Help');
-}
-
 function addPatchItems(menu, context, MenuItem) {
   const help = findSubmenu(menu, 'help-menu', new Set(['help']));
   if (help && !help.getMenuItemById?.(UPDATE_ITEM_ID)) {
@@ -704,7 +668,6 @@ function addPatchItems(menu, context, MenuItem) {
     }));
     diagnostic('update-menu: added Check for Updates to Help');
   }
-  addDecorationMenuItem(help, menu, context, MenuItem);
 }
 
 module.exports = {

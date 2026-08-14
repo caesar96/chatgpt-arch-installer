@@ -57,7 +57,7 @@ for (const name of uniqueRequested) {
     }
     const patchRoot = path.join(root, 'patches', name);
     const manifest = require(path.join(patchRoot, 'manifest.json'));
-    if (manifest.id !== name || manifest.entry !== 'main.js' || manifest.apiVersion !== 1) {
+    if (manifest.id !== name || !/^(?:index|main)\.js$/.test(manifest.entry) || manifest.apiVersion !== 1) {
       throw new Error('invalid patch manifest');
     }
     if (manifest.applicationVersions && !manifest.applicationVersions.includes(appVersion)) {

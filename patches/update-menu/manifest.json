@@ -1,7 +1,7 @@
 {
   "id": "update-menu",
   "name": "Updates and Window Menu",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "entry": "main.js",
   "enabled": false,
   "apiVersion": 1

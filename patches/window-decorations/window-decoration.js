@@ -99,7 +99,6 @@ function replaceBrowserWindow(electron, BrowserWindow, context) {
 }
 
 module.exports = {
-  id: 'window-decorations',
   onLoad(context) {
     if (process.platform !== 'linux') return;
     if (!context.settings?.systemWindowDecorations) {

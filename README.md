@@ -76,6 +76,8 @@ chatgpt update                  # Download and install the latest version
 chatgpt check-update            # Check package metadata only
 chatgpt --debug                 # Launch with patch diagnostics enabled
 chatgpt patches status          # Show enabled patches
+chatgpt decorations enable      # Enable native window decorations
+chatgpt decorations disable     # Disable native window decorations
 chatgpt uninstall               # Remove the app but preserve user data
 chatgpt uninstall --no-preserve-data
 chatgpt --help
@@ -110,13 +112,16 @@ chatgpt --no-patches
 The bundled external patches are:
 
 - `update-menu`: adds `Help -> Check for Updates...` and performs lightweight
-  startup update checks, plus the native-decoration menu item. The menu action
-  invokes the shared external helper and relaunches the app.
-- `window-decorations`: when enabled on Linux, intercepts Electron's
-  `BrowserWindow` module before the vendor application receives it. It removes
-  hidden title-bar options, forces `frame: true` for normal top-level windows,
-  and ignores `setTitleBarOverlay`. Transparent, modal, parented, and utility
-  windows are left unchanged.
+  startup update checks.
+- `window-decorations`: a complete native-decoration package. Its `index.js`
+  coordinates the two parts below:
+  - `window-decoration.js` intercepts Electron's `BrowserWindow` module before
+    the vendor application receives it. It removes hidden title-bar options,
+    forces `frame: true` for normal top-level windows, and ignores
+    `setTitleBarOverlay`. Transparent, modal, parented, and utility windows are
+    left unchanged.
+  - `window-decoration-menu.js` adds the Help item and invokes the shared
+    external helper to persist the preference and relaunch the app.
 
 Patches are loaded through `NODE_OPTIONS` before the app's first real
 `require('electron')`. The loader exposes an invariant-safe Electron module
@@ -150,10 +155,10 @@ result is shown on startup even while the network check is throttled. Failed
 network checks do not advance the successful-check timestamp.
 
 The native-decoration toggle saves its preference in `settings.conf`, waits for
-the current app process to exit, runs the shared `chatgpt patches` command, and
-relaunches through `bin/chatgpt-launcher`. The external injection is therefore
-still present after the restart. Updating the vendor payload does not require a
-post-update repatching step.
+the current app process to exit, runs the shared `chatgpt decorations` command,
+and relaunches through `bin/chatgpt-launcher`. The external injection is
+therefore still present after the restart. Updating the vendor payload does not
+require a post-update repatching step.
 
 ## Installed layout
 
@@ -171,6 +176,9 @@ The installed tree deliberately uses semantic names:
                                         Native-decoration menu helper
   patches/update-menu/
   patches/window-decorations/
+    index.js                            Patch entrypoint
+    window-decoration.js                Electron window interception
+    window-decoration-menu.js           Help menu integration
   state/
   update-cache/                         Downloaded package and staged updates
 

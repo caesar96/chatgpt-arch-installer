@@ -22,7 +22,7 @@ while kill -0 "$APP_PID" 2>/dev/null; do
   sleep 0.1
 done
 
-if "$CLI_PATH" patches "$ACTION" window-decorations >"$log_file" 2>&1; then
+if "$CLI_PATH" decorations "$ACTION" >"$log_file" 2>&1; then
   printf 'Native window decorations %s.\n' "$ACTION" >>"$log_file"
 else
   printf 'chatgpt: could not %s native window decorations\n' "$ACTION" >>"$log_file"
