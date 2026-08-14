@@ -1,0 +1,8 @@
+{
+  "id": "global-menu",
+  "name": "KDE Global Menu",
+  "version": "3.0.0",
+  "entry": "index.js",
+  "enabled": false,
+  "apiVersion": 1
+}

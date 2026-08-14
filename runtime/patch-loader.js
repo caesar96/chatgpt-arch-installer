@@ -39,6 +39,19 @@ const settings = settingsModule.readSettings();
 if (settings.systemWindowDecorations && !uniqueRequested.includes('native-window-decorations')) {
   uniqueRequested.push('native-window-decorations');
 }
+
+// The renderer's mac-layout chrome occupies the same top strip that Electron
+// uses for its in-window Linux menu. Keep it only when the application menu is
+// exported to Plasma's Global Menu; otherwise native decorations must retain
+// the Electron menu inside the window.
+const nativeWindowDecorationsEnabled = settings.systemWindowDecorations
+  || uniqueRequested.includes('native-window-decorations');
+const globalMenuEnabled = uniqueRequested.includes('global-menu');
+const effectiveRequested = uniqueRequested.filter((name) => !(
+  name === 'mac-layout'
+  && nativeWindowDecorationsEnabled
+  && !globalMenuEnabled
+));
 let electronModuleProxy;
 
 if (globalThis.__chatgptExternalPatchLoader) {
@@ -47,7 +60,7 @@ if (globalThis.__chatgptExternalPatchLoader) {
 globalThis.__chatgptExternalPatchLoader = true;
 
 function loadPatches(electron) {
-for (const name of uniqueRequested) {
+for (const name of effectiveRequested) {
   try {
     if (!/^[a-z0-9-]+$/.test(name)) {
       throw new Error(`invalid ChatGPT patch name: ${name}`);

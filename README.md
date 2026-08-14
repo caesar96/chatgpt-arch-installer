@@ -15,6 +15,10 @@ not use `dpkg`, `apt`, AUR build scripts, `sudo`, or system package databases.
 - Adds a user-level `chatgpt.desktop` launcher matching the package name.
 - Optionally enables native Linux/KDE window decorations through external
   runtime injection, without modifying `app.asar`.
+- Keeps the application menu inside the window as Electron's native Linux
+  menu by default.
+- Optionally exports the Electron application menu to KDE Plasma's Global Menu
+  through a separate, opt-in `global-menu` patch.
 - Provides themed `Help -> Check for Updates...` and native-decoration toggle
   items.
 - Treats the downloaded application, including `app.asar`, as immutable vendor
@@ -31,6 +35,15 @@ inspection, desktop integration, and updates, including `curl`, `ar`, `tar`,
 `xz`, `ldd`, `ldconfig`, `awk`, `readlink`, `ln`, `xdg-open`, and `xdg-mime`.
 It also checks the GUI libraries required by Electron and the bundled Codex
 runtime. Native window decorations do not require Python or system services.
+The optional Global Menu patch uses a GLib DBusMenu exporter backed by
+`libdbusmenu-glib`; KDE Plasma's Global Menu registrar must be available in
+the session. It also requires Python GObject introspection with Dbusmenu 0.4.
+The GTK `appmenu-gtk-module` is not required by ChatGPT's exporter; it is only
+useful for other GTK applications.
+The launcher sets Electron's `ELECTRON_FORCE_WINDOW_MENU_BAR=1` by default, so
+the native application menu remains inside the ChatGPT window instead of being
+registered with Plasma's Global Menu. The `global-menu` patch is disabled by
+default; enable it with `chatgpt patches enable global-menu`.
 
 ## Installation
 
@@ -76,6 +89,7 @@ chatgpt update                  # Download and install the latest version
 chatgpt check-update            # Check package metadata only
 chatgpt --debug                 # Launch with patch diagnostics enabled
 chatgpt patches status          # Show enabled patches
+chatgpt patches enable global-menu
 chatgpt decorations enable      # Enable native window decorations
 chatgpt decorations disable     # Disable native window decorations
 chatgpt uninstall               # Remove the app but preserve user data
@@ -105,12 +119,18 @@ chatgpt patches list
 chatgpt patches status
 chatgpt patches enable update-menu
 chatgpt patches enable native-window-decorations
+chatgpt patches enable mac-layout
 chatgpt patches disable native-window-decorations
 chatgpt --no-patches
 ```
 
 The bundled external patches are:
 
+- `global-menu`: exports ChatGPT's native Electron application menu to KDE
+  Plasma's Global Menu through the system `libdbusmenu-glib` implementation.
+  It keeps the menu synchronized and forwards menu activation back to
+  Electron. It is intended for X11/XWayland sessions; explicit native
+  Wayland launches are not supported by this exporter.
 - `update-menu`: adds `Help -> Check for Updates...` and performs lightweight
   startup update checks.
 - `native-window-decorations`: a complete native-decoration package. Its `index.js`
@@ -118,10 +138,18 @@ The bundled external patches are:
   - `window-decoration.js` intercepts Electron's `BrowserWindow` module before
     the vendor application receives it. It removes hidden title-bar options,
     forces `frame: true` for normal top-level windows, and ignores
-    `setTitleBarOverlay`. Transparent, modal, parented, and utility windows are
-    left unchanged.
+    `setTitleBarOverlay`. When the Global Menu is disabled, it also preserves
+    Electron's native in-window menu against the vendor's Linux `removeMenu()`
+    call. Transparent, modal, parented, and utility windows are left unchanged.
   - `window-decoration-menu.js` adds the Help item and invokes the shared
     external helper to persist the preference and relaunch the app.
+- `mac-layout`: selects the renderer's existing native/macOS-style chrome path
+  on Linux without pretending the operating system is macOS. It uses
+  Electron's external `addScriptToEvaluateOnNewDocument` hook; it does not
+  edit `app.asar` or replace the vendor preload. When native window decorations
+  are enabled, the loader applies this patch only while `global-menu` is also
+  enabled; otherwise the renderer chrome would cover Electron's native
+  in-window menu.
 
 Patches are loaded through `NODE_OPTIONS` before the app's first real
 `require('electron')`. The loader exposes an invariant-safe Electron module
@@ -179,6 +207,13 @@ The installed tree deliberately uses semantic names:
     index.js                            Patch entrypoint
     window-decoration.js                Electron window interception
     window-decoration-menu.js           Help menu integration
+  patches/mac-layout/
+    manifest.json                       Patch metadata
+    index.js                            Renderer layout hook
+  patches/global-menu/
+    manifest.json                       Patch metadata
+    index.js                            Electron menu bridge
+  runtime/chatgpt-global-menu.py        GLib DBusMenu exporter
   state/
   update-cache/                         Downloaded package and staged updates
 

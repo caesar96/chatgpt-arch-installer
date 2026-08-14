@@ -8,6 +8,32 @@ function diagnostic(context, message) {
   context.diagnostic?.(`[window-decoration-menu] ${message}`);
 }
 
+function preservesNativeWindowMenu(context) {
+  const enabledPatches = String(context.settings?.patches || '')
+    .split(',')
+    .map((patch) => patch.trim())
+    .filter(Boolean);
+  return !enabledPatches.includes('global-menu');
+}
+
+function attachMenuToNativeWindows(menu, context) {
+  if (!preservesNativeWindowMenu(context)) return;
+  context.nativeApplicationMenu = menu || null;
+  for (const window of context.nativeDecoratedWindows || []) {
+    if (!window || window.isDestroyed?.()) continue;
+    try {
+      window.setAutoHideMenuBar?.(false);
+      window.setMenu?.(menu || null);
+      window.setMenuBarVisibility?.(true);
+      const itemCount = window.getMenu?.()?.items?.length ?? 'unknown';
+      const visible = window.isMenuBarVisible?.();
+      diagnostic(context, `attached Electron application menu to native window (items=${itemCount}, visible=${visible})`);
+    } catch (error) {
+      diagnostic(context, `WARN: could not attach Electron application menu: ${error.message}`);
+    }
+  }
+}
+
 function findSubmenu(menu, id, labels) {
   if (!menu || !Array.isArray(menu.items)) return null;
   const identified = id && menu.getMenuItemById?.(id);
@@ -65,7 +91,9 @@ module.exports = {
         diagnostic(context, `menu patch failed: ${error.message}`);
         process.emitWarning(`ChatGPT native decoration menu was skipped: ${error.message}`);
       }
-      return originalSetApplicationMenu.call(this, menu);
+      const result = originalSetApplicationMenu.call(this, menu);
+      attachMenuToNativeWindows(menu, context);
+      return result;
     };
     setApplicationMenu.__chatgptExternalDecorationMenuPatch = true;
     Menu.setApplicationMenu = setApplicationMenu;

@@ -24,12 +24,44 @@ function shouldPatch(options) {
   return true;
 }
 
-function systemDecorationOptions(originalOptions) {
+function preservesNativeWindowMenu(context) {
+  const enabledPatches = String(context.settings?.patches || '')
+    .split(',')
+    .map((patch) => patch.trim())
+    .filter(Boolean);
+  return !enabledPatches.includes('global-menu');
+}
+
+function rememberNativeWindow(window, context) {
+  if (!context.nativeDecoratedWindows) context.nativeDecoratedWindows = new Set();
+  context.nativeDecoratedWindows.add(window);
+  window.once?.('closed', () => context.nativeDecoratedWindows?.delete(window));
+}
+
+function attachApplicationMenu(window, context) {
+  const menu = context.nativeApplicationMenu;
+  if (!menu || typeof window?.setMenu !== 'function') return;
+  try {
+    window.setMenu(menu);
+    const itemCount = window.getMenu?.()?.items?.length ?? 'unknown';
+    const visible = window.isMenuBarVisible?.();
+    diagnostic(context, `attached Electron application menu to native window (items=${itemCount}, visible=${visible})`);
+  } catch (error) {
+    diagnostic(context, `WARN: could not attach Electron application menu: ${error.message}`);
+  }
+}
+
+function systemDecorationOptions(originalOptions, context) {
   const options = { ...originalOptions, frame: true };
   // ChatGPT asks Electron for a hidden title bar on Linux and paints its own
   // title bar. Removing these options lets the window manager own the frame.
   delete options.titleBarStyle;
   delete options.titleBarOverlay;
+  if (preservesNativeWindowMenu(context)) {
+    // The vendor creates a native Electron menu, then configures normal Linux
+    // windows to hide it. Keep it visible when the Global Menu is disabled.
+    options.autoHideMenuBar = false;
+  }
   return options;
 }
 
@@ -54,6 +86,58 @@ function disableTitleBarOverlay(window, context) {
   }
 }
 
+function preserveNativeWindowMenu(window, context) {
+  if (!preservesNativeWindowMenu(context)) return;
+  if (!window) return;
+  try {
+    rememberNativeWindow(window, context);
+    // ChatGPT configures Linux windows with autoHideMenuBar and later calls
+    // removeMenu(). The native-menu mode must keep Electron's application
+    // menu visible after both operations, not only at construction time.
+    window.setAutoHideMenuBar?.(false);
+
+    const originalSetMenuBarVisibility = typeof window.setMenuBarVisibility === 'function'
+      ? window.setMenuBarVisibility.bind(window)
+      : null;
+    const ignoredMenuBarHide = function ignoredMenuBarHide(visible) {
+      if (visible === false) {
+        diagnostic(context, 'ignored vendor setMenuBarVisibility(false); keeping native in-window menu');
+      }
+      if (originalSetMenuBarVisibility) return originalSetMenuBarVisibility(true);
+      return undefined;
+    };
+    try {
+      Object.defineProperty(window, 'setMenuBarVisibility', {
+        configurable: true,
+        enumerable: false,
+        writable: true,
+        value: ignoredMenuBarHide,
+      });
+    } catch (_) {
+      window.setMenuBarVisibility = ignoredMenuBarHide;
+    }
+    window.setMenuBarVisibility?.(true);
+    attachApplicationMenu(window, context);
+    if (typeof window.removeMenu !== 'function') return;
+    const ignoredVendorRemoveMenu = function ignoredVendorRemoveMenu() {
+      diagnostic(context, 'ignored vendor removeMenu; keeping native in-window menu');
+      this.setMenuBarVisibility?.(true);
+    };
+    try {
+      Object.defineProperty(window, 'removeMenu', {
+        configurable: true,
+        enumerable: false,
+        writable: true,
+        value: ignoredVendorRemoveMenu,
+      });
+    } catch (_) {
+      window.removeMenu = ignoredVendorRemoveMenu;
+    }
+  } catch (error) {
+    diagnostic(context, `WARN: could not preserve native in-window menu: ${error.message}`);
+  }
+}
+
 function replaceBrowserWindow(electron, BrowserWindow, context) {
   const PatchedBrowserWindow = new Proxy(BrowserWindow, {
     construct(target, argumentsList, newTarget) {
@@ -61,11 +145,12 @@ function replaceBrowserWindow(electron, BrowserWindow, context) {
       if (!shouldPatch(originalOptions)) {
         return Reflect.construct(target, argumentsList, newTarget);
       }
-      const options = systemDecorationOptions(originalOptions);
+      const options = systemDecorationOptions(originalOptions, context);
       diagnostic(context, 'patched main window: native Linux frame options');
       try {
         const window = Reflect.construct(target, [options, ...argumentsList.slice(1)], newTarget);
         disableTitleBarOverlay(window, context);
+        preserveNativeWindowMenu(window, context);
         return window;
       } catch (error) {
         diagnostic(context, `WARN: patched BrowserWindow construction failed: ${error.message}; retrying original options`);

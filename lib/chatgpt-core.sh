@@ -67,7 +67,7 @@ chatgpt_usage() {
     '  chatgpt --debug  Launch with external patch diagnostics enabled' \
     '  chatgpt --no-patches  Launch once without external patches' \
     '  DECORATION_OPTION: --native-window-decoration or --no-native-window-decoration' \
-    '  NAME: native-window-decorations or update-menu'
+    '  NAME: global-menu, mac-layout, native-window-decorations, or update-menu'
 }
 
 resolve_self_path() {
@@ -199,6 +199,15 @@ check_desktop_helpers() {
   printf '%s\n' 'chatgpt: missing desktop trash helper (gio, kioclient6, kioclient, or trash)' >&2
   printf '%s\n' 'The app may still launch, but delete-to-trash integration will be unavailable.' >&2
   return 1
+}
+
+check_global_menu_support() {
+  command -v python3 >/dev/null 2>&1 \
+    || die 'global-menu requires python3'
+  if ! python3 -c "import gi; gi.require_version('Dbusmenu', '0.4'); from gi.repository import Dbusmenu, Gio, GLib" \
+    >/dev/null 2>&1; then
+    die 'global-menu requires Python GObject introspection for Dbusmenu 0.4'
+  fi
 }
 
 check_binary_dependencies() {
@@ -686,6 +695,10 @@ write_run_launcher() {
     'USER_DATA_DIRECTORY=${XDG_CONFIG_HOME:-$HOME/.config}/chatgpt/user-data' \
     'mkdir -p "$USER_DATA_DIRECTORY"' \
     'if [ -r "$CONFIG_FILE" ]; then export CHATGPT_PATCHES=$(awk -F= '\''$1 == "patches" {print $2; exit}'\'' "$CONFIG_FILE"); fi' \
+    'case ",${CHATGPT_PATCHES-}," in' \
+    '  *,global-menu,*) unset ELECTRON_FORCE_WINDOW_MENU_BAR ;;' \
+    '  *) export ELECTRON_FORCE_WINDOW_MENU_BAR=1 ;;' \
+    'esac' \
     'if [ "${CHATGPT_DEBUG-0}" = 1 ]; then export CHATGPT_PATCH_DIAGNOSTIC="$APP_ROOT/state/patch-diagnostic.log"; fi' \
     'if [ "${CHATGPT_NO_PATCHES-0}" != 1 ] && [ -n "${CHATGPT_PATCHES-}" ]; then' \
     '  export CHATGPT_PATCH_ROOT="$APP_ROOT"' \
@@ -702,12 +715,15 @@ set_patch_enabled() {
   patch_id=$(canonical_patch_id "$1")
   requested_state=$2
   case "$patch_id" in
-    native-window-decorations|update-menu) ;;
+    global-menu|mac-layout|native-window-decorations|update-menu) ;;
     *) die "unknown patch: $patch_id" ;;
   esac
 
   case "$requested_state" in
     enable)
+      if [ "$patch_id" = global-menu ]; then
+        check_global_menu_support
+      fi
       case ",$PATCHES," in *,"$patch_id",*) ;; *) PATCHES=${PATCHES:+$PATCHES,}$patch_id ;; esac
       ;;
     disable)
@@ -758,7 +774,8 @@ copy_support_files() {
     "$support_source/bin/chatgpt" \
     "$support_source/runtime/patch-loader.js" \
     "$support_source/runtime/settings.js" \
-    "$support_source/runtime/chatgpt-toggle-window-decorations.sh"; do
+    "$support_source/runtime/chatgpt-toggle-window-decorations.sh" \
+    "$support_source/runtime/chatgpt-global-menu.py"; do
     [ -r "$support_file" ] || die "required ChatGPT support file is missing: $support_file"
   done
 
@@ -770,11 +787,14 @@ copy_support_files() {
   cp "$support_source/runtime/patch-loader.js" "$support_temporary/runtime/patch-loader.js"
   cp "$support_source/runtime/settings.js" "$support_temporary/runtime/settings.js"
   cp "$support_source/runtime/chatgpt-toggle-window-decorations.sh" "$support_temporary/runtime/chatgpt-toggle-window-decorations.sh"
+  cp "$support_source/runtime/chatgpt-global-menu.py" "$support_temporary/runtime/chatgpt-global-menu.py"
+  cp -a "$support_source/patches/global-menu" "$support_temporary/patches/"
   cp -a "$support_source/patches/update-menu" "$support_temporary/patches/"
   cp -a "$support_source/patches/native-window-decorations" "$support_temporary/patches/"
-  chmod 644 "$support_temporary/lib/chatgpt-core.sh" "$support_temporary/runtime/patch-loader.js" "$support_temporary/patches"/*/*.js "$support_temporary/patches"/*/*.json
-  chmod 644 "$support_temporary/runtime/settings.js"
+  cp -a "$support_source/patches/mac-layout" "$support_temporary/patches/"
+  chmod 644 "$support_temporary/lib/chatgpt-core.sh" "$support_temporary/runtime/patch-loader.js" "$support_temporary/runtime/settings.js" "$support_temporary/patches"/*/*.js "$support_temporary/patches"/*/*.json
   chmod 755 "$support_temporary/runtime/chatgpt-toggle-window-decorations.sh"
+  chmod 755 "$support_temporary/runtime/chatgpt-global-menu.py"
   chmod 755 "$support_temporary/bin/chatgpt"
 
   backup_support="$temporary_root/original-support"
@@ -1240,7 +1260,7 @@ load_configured_root() {
   fi
   patches_setting=$(awk -F= '$1 == "patches" {print "present"; exit}' "$CONFIG_READ_FILE")
   if [ -z "$patches_setting" ]; then
-    PATCHES=update-menu,native-window-decorations
+    PATCHES=update-menu,native-window-decorations,mac-layout
   fi
   normalize_patch_list
 }
@@ -1389,7 +1409,7 @@ install_app() {
   check_host_libraries || exit 1
   check_desktop_helpers || exit 1
   ask_native_decoration_preference
-  PATCHES=update-menu,native-window-decorations
+  PATCHES=update-menu,native-window-decorations,mac-layout
   resolve_install_root "$1"
   prepare_install_root
   install_payload
@@ -1573,7 +1593,7 @@ chatgpt_cli_main() {
       [ "$NO_PATCHES" -eq 0 ] || die '--no-patches cannot be used with patch management'
       shift
       case "${1-}" in
-        list) printf '%s\n' 'native-window-decorations' 'update-menu' ;;
+        list) printf '%s\n' 'global-menu' 'mac-layout' 'native-window-decorations' 'update-menu' ;;
         status) printf 'Enabled patches: %s\n' "${PATCHES:-none}" ;;
          enable|disable)
            [ "$#" -eq 2 ] || die 'usage: chatgpt patches enable|disable NAME'

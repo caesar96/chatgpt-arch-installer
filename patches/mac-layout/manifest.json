@@ -1,0 +1,8 @@
+{
+  "id": "mac-layout",
+  "name": "macOS-style Linux Layout",
+  "version": "1.0.0",
+  "entry": "index.js",
+  "enabled": false,
+  "apiVersion": 1
+}
