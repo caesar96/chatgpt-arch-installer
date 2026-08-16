@@ -12,6 +12,37 @@ const UTILITY_TYPES = new Set([
   'tooltip',
 ]);
 
+// Codex normally enables its renderer-owned application menu on Linux. That
+// chrome contains the sidebar and history controls in the same row as the
+// File/Edit/View/Help buttons. When Electron owns the in-window menu, switch
+// the renderer to its native chrome mode so it leaves that row to Electron.
+const FORCE_NATIVE_CHROME_SCRIPT = String.raw`(() => {
+  if (window.__chatgptNativeInWindowMenuHookInstalled) return;
+  window.__chatgptNativeInWindowMenuHookInstalled = true;
+
+  const forceNativeChrome = () => {
+    const root = document.documentElement;
+    if (!root) return;
+    if (root.getAttribute('data-codex-window-chrome') !== 'native') {
+      root.setAttribute('data-codex-window-chrome', 'native');
+    }
+  };
+
+  forceNativeChrome();
+  const root = document.documentElement || document;
+  const observer = new MutationObserver((records) => {
+    if (records.some((record) => record.attributeName === 'data-codex-window-chrome')) {
+      forceNativeChrome();
+    }
+  });
+  observer.observe(root, {
+    subtree: true,
+    attributes: true,
+    attributeFilter: ['data-codex-window-chrome'],
+  });
+  window.addEventListener('DOMContentLoaded', forceNativeChrome);
+})();`;
+
 function diagnostic(context, message) {
   context.diagnostic?.(`[window-decoration] ${message}`);
 }
@@ -86,6 +117,81 @@ function disableTitleBarOverlay(window, context) {
   }
 }
 
+function getApplicationMenu(context) {
+  return context.nativeApplicationMenu
+    || context.electron?.Menu?.getApplicationMenu?.()
+    || null;
+}
+
+function enforceNativeMenu(window, context, originalSetMenuBarVisibility = null) {
+  if (!window || window.isDestroyed?.()) return;
+  const menu = getApplicationMenu(context);
+  try {
+    if (menu && typeof window.setMenu === 'function') {
+      // Electron can create its X11 GlobalMenuBar object on an earlier
+      // setMenu() call. Passing null first tears that object down; the next
+      // setMenu(menu) then rebuilds the ordinary in-window RootView menu.
+      window.setMenu(null);
+      window.setMenu(menu);
+    }
+    window.setAutoHideMenuBar?.(false);
+    if (originalSetMenuBarVisibility) {
+      originalSetMenuBarVisibility(true);
+    } else {
+      window.setMenuBarVisibility?.(true);
+    }
+    const visible = window.isMenuBarVisible?.();
+    const autoHide = window.isMenuBarAutoHide?.();
+    const itemCount = menu?.items?.length ?? 'unknown';
+    diagnostic(context, `enforced native in-window menu (menu=${menu ? 'present' : 'pending'}, items=${itemCount}, visible=${visible}, autoHide=${autoHide})`);
+  } catch (error) {
+    diagnostic(context, `WARN: could not enforce native in-window menu: ${error.message}`);
+  }
+}
+
+function installNativeInWindowMenuHook(window, context) {
+  if (!preservesNativeWindowMenu(context)) return;
+  const webContents = window?.webContents;
+  if (!webContents) {
+    diagnostic(context, 'WARN: BrowserWindow webContents is unavailable for native menu chrome hook');
+    return;
+  }
+
+  if (typeof webContents.addScriptToEvaluateOnNewDocument === 'function') {
+    try {
+      Promise.resolve(webContents.addScriptToEvaluateOnNewDocument(FORCE_NATIVE_CHROME_SCRIPT))
+        .then(() => diagnostic(context, 'registered native in-window menu renderer hook'))
+        .catch((error) => diagnostic(context, `WARN: native menu renderer hook failed: ${error.message}`));
+      return;
+    } catch (error) {
+      diagnostic(context, `WARN: native menu renderer hook registration failed: ${error.message}`);
+    }
+  }
+
+  if (typeof webContents.executeJavaScript !== 'function' || typeof webContents.on !== 'function') {
+    diagnostic(context, 'WARN: webContents has no native menu renderer hook fallback');
+    return;
+  }
+
+  let injected = false;
+  const inject = () => {
+    if (injected) return;
+    try {
+      Promise.resolve(webContents.executeJavaScript(FORCE_NATIVE_CHROME_SCRIPT, true))
+        .then(() => {
+          injected = true;
+          diagnostic(context, 'registered native in-window menu renderer hook through executeJavaScript');
+        })
+        .catch((error) => diagnostic(context, `WARN: native menu renderer fallback failed: ${error.message}`));
+    } catch (error) {
+      diagnostic(context, `WARN: native menu renderer fallback failed: ${error.message}`);
+    }
+  };
+  webContents.on('did-start-loading', inject);
+  webContents.on('dom-ready', inject);
+  diagnostic(context, 'using native menu renderer hook fallback');
+}
+
 function preserveNativeWindowMenu(window, context) {
   if (!preservesNativeWindowMenu(context)) return;
   if (!window) return;
@@ -94,6 +200,26 @@ function preserveNativeWindowMenu(window, context) {
     // ChatGPT configures Linux windows with autoHideMenuBar and later calls
     // removeMenu(). The native-menu mode must keep Electron's application
     // menu visible after both operations, not only at construction time.
+    const originalSetAutoHideMenuBar = typeof window.setAutoHideMenuBar === 'function'
+      ? window.setAutoHideMenuBar.bind(window)
+      : null;
+    const ignoredMenuBarAutoHide = function ignoredMenuBarAutoHide(hide) {
+      if (hide === true) {
+        diagnostic(context, 'ignored vendor setAutoHideMenuBar(true); keeping native in-window menu');
+      }
+      if (originalSetAutoHideMenuBar) return originalSetAutoHideMenuBar(false);
+      return undefined;
+    };
+    try {
+      Object.defineProperty(window, 'setAutoHideMenuBar', {
+        configurable: true,
+        enumerable: false,
+        writable: true,
+        value: ignoredMenuBarAutoHide,
+      });
+    } catch (_) {
+      window.setAutoHideMenuBar = ignoredMenuBarAutoHide;
+    }
     window.setAutoHideMenuBar?.(false);
 
     const originalSetMenuBarVisibility = typeof window.setMenuBarVisibility === 'function'
@@ -116,12 +242,13 @@ function preserveNativeWindowMenu(window, context) {
     } catch (_) {
       window.setMenuBarVisibility = ignoredMenuBarHide;
     }
-    window.setMenuBarVisibility?.(true);
+    const setMenuBarVisibility = originalSetMenuBarVisibility;
+    enforceNativeMenu(window, context, setMenuBarVisibility);
     attachApplicationMenu(window, context);
     if (typeof window.removeMenu !== 'function') return;
     const ignoredVendorRemoveMenu = function ignoredVendorRemoveMenu() {
       diagnostic(context, 'ignored vendor removeMenu; keeping native in-window menu');
-      this.setMenuBarVisibility?.(true);
+      enforceNativeMenu(this, context);
     };
     try {
       Object.defineProperty(window, 'removeMenu', {
@@ -150,7 +277,12 @@ function replaceBrowserWindow(electron, BrowserWindow, context) {
       try {
         const window = Reflect.construct(target, [options, ...argumentsList.slice(1)], newTarget);
         disableTitleBarOverlay(window, context);
+        installNativeInWindowMenuHook(window, context);
         preserveNativeWindowMenu(window, context);
+        const enforceLater = () => enforceNativeMenu(window, context);
+        for (const delay of [0, 50, 250, 1000]) {
+          setTimeout(enforceLater, delay).unref?.();
+        }
         return window;
       } catch (error) {
         diagnostic(context, `WARN: patched BrowserWindow construction failed: ${error.message}; retrying original options`);
@@ -199,10 +331,30 @@ module.exports = {
       diagnostic(context, 'BrowserWindow interception already installed');
       return;
     }
+
     const patched = replaceBrowserWindow(context.electron, BrowserWindow, context);
     if (!patched) {
       diagnostic(context, 'WARN: BrowserWindow interception could not be installed; continuing without the patch');
       return;
+    }
+
+    const app = context.electron?.app;
+    if (app?.whenReady && !app[Symbol.for('chatgpt.nativeMenuReadyListener')]) {
+      try {
+        const reapply = () => {
+          for (const window of context.nativeDecoratedWindows || []) {
+            enforceNativeMenu(window, context);
+          }
+        };
+        app.whenReady().then(() => {
+          for (const delay of [0, 100, 500, 1500]) {
+            setTimeout(reapply, delay).unref?.();
+          }
+        }).catch((error) => diagnostic(context, `WARN: native menu ready hook failed: ${error.message}`));
+        Object.defineProperty(app, Symbol.for('chatgpt.nativeMenuReadyListener'), { value: true });
+      } catch (error) {
+        diagnostic(context, `WARN: could not install native menu ready hook: ${error.message}`);
+      }
     }
     diagnostic(context, 'enabled');
     diagnostic(context, 'BrowserWindow interception installed');

@@ -52,6 +52,17 @@ const effectiveRequested = uniqueRequested.filter((name) => !(
   && nativeWindowDecorationsEnabled
   && !globalMenuEnabled
 ));
+
+// Electron decides whether a Linux window should use its DBusMenu backend
+// when the first native menu is attached. Set the switch here, before the
+// first real `require('electron')`, so an installed libdbusmenu-glib and the
+// KDE registrar cannot move a menu to the panel while Global Menu is off.
+// The launcher also exports this variable, but keeping the invariant in the
+// preload makes desktop-file and direct-launch paths behave identically.
+if (process.platform === 'linux') {
+  if (globalMenuEnabled) delete process.env.ELECTRON_FORCE_WINDOW_MENU_BAR;
+  else process.env.ELECTRON_FORCE_WINDOW_MENU_BAR = '1';
+}
 let electronModuleProxy;
 
 if (globalThis.__chatgptExternalPatchLoader) {

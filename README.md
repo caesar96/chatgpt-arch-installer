@@ -40,9 +40,10 @@ The optional Global Menu patch uses a GLib DBusMenu exporter backed by
 the session. It also requires Python GObject introspection with Dbusmenu 0.4.
 The GTK `appmenu-gtk-module` is not required by ChatGPT's exporter; it is only
 useful for other GTK applications.
-The launcher sets Electron's `ELECTRON_FORCE_WINDOW_MENU_BAR=1` by default, so
-the native application menu remains inside the ChatGPT window instead of being
-registered with Plasma's Global Menu. The `global-menu` patch is disabled by
+The launcher and preload set Electron's `ELECTRON_FORCE_WINDOW_MENU_BAR=1` by
+default, so the native application menu remains inside the ChatGPT window
+instead of being registered with Plasma's Global Menu, even when
+`libdbusmenu-glib` is installed. The `global-menu` patch is disabled by
 default; enable it with `chatgpt patches enable global-menu`.
 
 ## Installation
@@ -138,18 +139,20 @@ The bundled external patches are:
   - `window-decoration.js` intercepts Electron's `BrowserWindow` module before
     the vendor application receives it. It removes hidden title-bar options,
     forces `frame: true` for normal top-level windows, and ignores
-    `setTitleBarOverlay`. When the Global Menu is disabled, it also preserves
+    `setTitleBarOverlay`. When the Global Menu is disabled, it also switches
+    Codex's renderer away from its HTML application-menu chrome, preserves
     Electron's native in-window menu against the vendor's Linux `removeMenu()`
-    call. Transparent, modal, parented, and utility windows are left unchanged.
+    call, and keeps that menu visible. Transparent, modal, parented, and
+    utility windows are left unchanged.
   - `window-decoration-menu.js` adds the Help item and invokes the shared
     external helper to persist the preference and relaunch the app.
 - `mac-layout`: selects the renderer's existing native/macOS-style chrome path
   on Linux without pretending the operating system is macOS. It uses
   Electron's external `addScriptToEvaluateOnNewDocument` hook; it does not
-  edit `app.asar` or replace the vendor preload. When native window decorations
-  are enabled, the loader applies this patch only while `global-menu` is also
-  enabled; otherwise the renderer chrome would cover Electron's native
-  in-window menu.
+  edit `app.asar` or replace the vendor preload. It is retained as a separate
+  renderer-layout option for Global Menu mode; when native window decorations
+  are enabled without `global-menu`, `native-window-decorations` installs the
+  same renderer chrome switch itself so Electron owns the in-window menu row.
 
 Patches are loaded through `NODE_OPTIONS` before the app's first real
 `require('electron')`. The loader exposes an invariant-safe Electron module
