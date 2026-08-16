@@ -9,6 +9,7 @@ METADATA_RANGE_MAX_END=4194303
 FULL_DOWNLOAD_CHUNK_SIZE=16777216
 CONFIG_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/chatgpt/settings.conf
 CONFIG_DIRECTORY=${XDG_CONFIG_HOME:-$HOME/.config}/chatgpt
+FLAGS_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/chatgpt-flags.conf
 USER_DATA_DIRECTORY=$CONFIG_DIRECTORY/user-data
 DESKTOP_FILE=${XDG_DATA_HOME:-$HOME/.local/share}/applications/chatgpt.desktop
 MIME_APPS_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/mimeapps.list
@@ -699,12 +700,26 @@ write_run_launcher() {
     '  *,global-menu,*) unset ELECTRON_FORCE_WINDOW_MENU_BAR ;;' \
     '  *) export ELECTRON_FORCE_WINDOW_MENU_BAR=1 ;;' \
     'esac' \
+    'if [ "$#" -gt 0 ] && [ "$1" = "$APP_ROOT/usr/lib/chatgpt/resources/app.asar" ]; then shift; fi' \
+    'CHATGPT_OZONE_PLATFORM_DEFAULT=--ozone-platform=x11' \
+    'CHATGPT_FLAGS_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/chatgpt-flags.conf' \
+    'if [ -r "$CHATGPT_FLAGS_FILE" ]; then' \
+    '  while IFS= read -r CHATGPT_FLAG || [ -n "$CHATGPT_FLAG" ]; do' \
+    '    CHATGPT_FLAG=$(printf "%s\\n" "$CHATGPT_FLAG" | sed "s/^[[:space:]]*//; s/[[:space:]]*$//")' \
+    '    case "$CHATGPT_FLAG" in' \
+    '      ""|\#*) continue ;;' \
+    '      --ozone-platform=*) CHATGPT_OZONE_PLATFORM_DEFAULT=; set -- "$@" "$CHATGPT_FLAG" ;;' \
+    '      --*) set -- "$@" "$CHATGPT_FLAG" ;;' \
+    '      *) printf "chatgpt: ignoring invalid flag in %s: %s\\n" "$CHATGPT_FLAGS_FILE" "$CHATGPT_FLAG" >&2 ;;' \
+    '    esac' \
+    '  done < "$CHATGPT_FLAGS_FILE"' \
+    'fi' \
+    'if [ -n "$CHATGPT_OZONE_PLATFORM_DEFAULT" ]; then set -- "$CHATGPT_OZONE_PLATFORM_DEFAULT" "$@"; fi' \
     'if [ "${CHATGPT_DEBUG-0}" = 1 ]; then export CHATGPT_PATCH_DIAGNOSTIC="$APP_ROOT/state/patch-diagnostic.log"; fi' \
     'if [ "${CHATGPT_NO_PATCHES-0}" != 1 ] && [ -n "${CHATGPT_PATCHES-}" ]; then' \
     '  export CHATGPT_PATCH_ROOT="$APP_ROOT"' \
     '  export NODE_OPTIONS="${NODE_OPTIONS-} --require=$APP_ROOT/runtime/patch-loader.js"' \
     'fi' \
-    'if [ "$#" -gt 0 ] && [ "$1" = "$APP_ROOT/usr/lib/chatgpt/resources/app.asar" ]; then shift; fi' \
     'exec "$APP_ROOT/usr/lib/chatgpt/ChatGPT" \' \
     '  --user-data-dir="$USER_DATA_DIRECTORY" \' \
     '  "$@"' > "$launcher_path"
@@ -1334,7 +1349,7 @@ remove_user_launchers() {
 }
 
 remove_preserved_data() {
-  rm -rf -- "$APP_ROOT/user-data" "$CODEX_DIRECTORY" "$CONFIG_DIRECTORY"
+  rm -rf -- "$APP_ROOT/user-data" "$CODEX_DIRECTORY" "$CONFIG_DIRECTORY" "$FLAGS_FILE"
 }
 
 uninstall_app() {
@@ -1352,7 +1367,8 @@ uninstall_app() {
     "$MIME_APPS_FILE" \
     "$DESKTOP_FILE" \
     "$COMMAND_PATH" \
-    "$CODEX_DIRECTORY"; do
+    "$CODEX_DIRECTORY" \
+    "$FLAGS_FILE"; do
     case "$uninstall_path" in
       /*) ;;
       *) die "uninstall path must be absolute: $uninstall_path" ;;
@@ -1376,9 +1392,9 @@ uninstall_app() {
     printf '%s\n' "Uninstalled ChatGPT from $APP_ROOT."
   fi
   if [ "$preserve_data" -eq 1 ]; then
-    printf '%s\n' 'Preserved ChatGPT profile data, ~/.codex, and ~/.config/chatgpt.'
+    printf '%s\n' 'Preserved ChatGPT profile data, ~/.codex, ~/.config/chatgpt, and the optional ~/.config/chatgpt-flags.conf.'
   else
-    printf '%s\n' 'Removed ChatGPT profile data, ~/.codex, and the ChatGPT configuration file.'
+    printf '%s\n' 'Removed ChatGPT profile data, ~/.codex, ChatGPT configuration, and the optional ~/.config/chatgpt-flags.conf.'
   fi
 }
 
