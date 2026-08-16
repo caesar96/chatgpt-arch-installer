@@ -113,6 +113,23 @@ chatgpt update --native-window-decoration
 chatgpt update --no-native-window-decoration
 ```
 
+## Troubleshooting
+
+If a live image shows the ChatGPT splash logo and then a black application
+content area, test the desktop GPU and X11/XWayland rendering path without the
+external patches:
+
+```bash
+chatgpt --no-patches --disable-gpu --ozone-platform=x11
+```
+
+This is a diagnostic launch only; these flags are not enabled by default. The
+splash and the main login page are separate startup stages, so a successful
+splash does not prove that the main renderer can paint correctly. If this
+command opens the login screen, the live image's graphics or Wayland/XWayland
+setup is the likely cause. Otherwise, run `chatgpt --debug` and inspect
+`<installation>/state/patch-diagnostic.log`.
+
 ## Patch management
 
 ```bash
